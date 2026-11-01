@@ -1346,18 +1346,22 @@ static int tex_upload(VkCommandBuffer cb, vkb_image *im) {
     // The writes so far are collected first: the write watch is read lazily, and the game's writes that filled the
     // texture before its first upload, seen only at the next look, came after the stamp - the same texture uploaded
     // again at once ("first", then "pages written": 37 of 119 slow uploads in a session, 2026-10-29).
-    if (!im->vpool_gen) nvn_dirty_protect(im->storage, L.size);
+    // Classify before touching storage: the first upload has no vpool_gen yet,
+    // but virtual addresses are PROT_NONE and must never be hashed directly.
+    uint64_t gen = totk_vpool_generation();
+    int virtual_pool = totk_vpool_gather((uintptr_t)im->storage, 0, NULL);
+    im->vpool_gen = virtual_pool ? gen : 0;
+    if (!virtual_pool) nvn_dirty_protect(im->storage, L.size);
     __atomic_store_n(&im->upload_stamp, nvn_dirty_now(), __ATOMIC_RELEASE);   // before reading: a write during the upload shows as dirty next time
     // the same for the contents hash (untracked memory only; a virtual pool's addresses are not readable as such)
-    im->content_hash = !im->vpool_gen && L.size <= HASH_MAX && !nvn_dirty_tracked(im->storage, L.size) ? tex_hash(im->storage, L.size) : 0;
+    im->content_hash = !virtual_pool && L.size <= HASH_MAX && !nvn_dirty_tracked(im->storage, L.size) ? tex_hash(im->storage, L.size) : 0;
     im->hash_sub = 0;
     // A texture in a virtual pool (TOTK streams world textures this way): its addresses are only reserved, the bytes
     // are in physical pools' pages mapped through the page table — gathered into a copy first. It uploads again when
     // the pages behind it are written or the mapping changes ([temporary]: any MapVirtual; Vulkan sparse binding later).
     const uint8_t *src = im->storage;
     uint8_t *gathered = NULL;
-    uint64_t gen = totk_vpool_generation();
-    if (totk_vpool_gather((uintptr_t)im->storage, 0, NULL)) {   // (length 0: only whether it is in a virtual pool)
+    if (virtual_pool) {
         gathered = malloc(L.size ? L.size : 1);
         if (!gathered) die("texture gather");
         totk_vpool_gather((uintptr_t)im->storage, L.size, gathered);

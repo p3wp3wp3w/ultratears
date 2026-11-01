@@ -41,7 +41,6 @@ enum { M_FREE, M_SAVE, M_TEMP, M_CACHE };
 enum { OPEN_READ = 1, OPEN_WRITE = 2, OPEN_APPEND = 4 };
 #define ROM_BASE 0x100000000ULL
 #define NROM 65536
-#define ROM_FALLBACK_HANDLE UINT64_MAX
 #define FILE_BASE 0x200000000ULL
 #define DIR_BASE 0x300000000ULL
 #define NFILES 1024
@@ -245,39 +244,18 @@ static unsigned romfs_open(uint64_t *out, const char *path, int mode) {
     uint64_t i = file_index(p);
     int fd = -1;
     if (i == UINT64_MAX) {
-        fprintf(stderr, "[totk-fs] RomFS: '%s' not indexed, providing safe fallback handle\n", p);
-        pthread_mutex_lock(&rom_lock);
-        for (uint64_t h = 1; h < NROM; h++) {
-            if (!rom_handles[h]) {
-                rom_handles[h] = ROM_FALLBACK_HANDLE;
-                rom_fds[h] = -1;
-                *out = ROM_BASE + h;
-                pthread_mutex_unlock(&rom_lock);
-                return 0;
-            }
-        }
-        pthread_mutex_unlock(&rom_lock);
+        runtime_fs_log("rom-not-found", path);
         return R_PATH_NOT_FOUND;
     }
     if (rom_folder) {
         char full[8192];
         snprintf(full, sizeof full, "%s/%s", rom_dir, p);
         if ((fd = open(full, O_RDONLY | O_BINARY)) < 0) {
-            fprintf(stderr, "[totk-fs] RomFS: '%s' failed to open, providing safe fallback handle\n", full);
-            pthread_mutex_lock(&rom_lock);
-            for (uint64_t h = 1; h < NROM; h++) {
-                if (!rom_handles[h]) {
-                    rom_handles[h] = ROM_FALLBACK_HANDLE;
-                    rom_fds[h] = -1;
-                    *out = ROM_BASE + h;
-                    pthread_mutex_unlock(&rom_lock);
-                    return 0;
-                }
-            }
-            pthread_mutex_unlock(&rom_lock);
+            runtime_fs_log("rom-open-failed", path);
             return R_PATH_NOT_FOUND;
         }
     }
+
     pthread_mutex_lock(&rom_lock);
     for (uint64_t h = 1; h < NROM; h++)
         if (!rom_handles[h]) { rom_handles[h] = i + 1; rom_fds[h] = fd; *out = ROM_BASE + h; pthread_mutex_unlock(&rom_lock); return 0; }
@@ -288,14 +266,6 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
     if (!out || offset < 0 || (!buffer && size)) return R_ROM_INVALID;
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!i) return R_ROM_INVALID;
-    if (i == ROM_FALLBACK_HANDLE) {
-        if (buffer && size) {
-            guest_prepare_write(buffer, size);
-            memset(buffer, 0, (size_t)size);
-        }
-        *out = size;
-        return 0;
-    }
     Entry e = entry(i - 1);
     if ((uint64_t)offset > e.size) return R_ROM_INVALID;
     uint64_t n = size < e.size - (uint64_t)offset ? size : e.size - (uint64_t)offset, done = 0;
@@ -311,22 +281,12 @@ static unsigned romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buff
 static unsigned romfs_size(int64_t *out, uint64_t h) {
     uint64_t i = rom_handles[h - ROM_BASE];
     if (!out || !i) return R_ROM_INVALID;
-    if (i == ROM_FALLBACK_HANDLE) {
-        *out = 0;
-        return 0;
-    }
     *out = (int64_t)entry(i - 1).size;
     return 0;
 }
 static void romfs_close(uint64_t h) {
     pthread_mutex_lock(&rom_lock);
     need(rom_handles[h - ROM_BASE] != 0, "close of a closed RomFS handle");
-    if (rom_handles[h - ROM_BASE] == ROM_FALLBACK_HANDLE) {
-        rom_handles[h - ROM_BASE] = 0;
-        rom_fds[h - ROM_BASE] = -1;
-        pthread_mutex_unlock(&rom_lock);
-        return;
-    }
     rom_handles[h - ROM_BASE] = 0;
     if (rom_folder && rom_fds[h - ROM_BASE] >= 0) close(rom_fds[h - ROM_BASE]);
     rom_fds[h - ROM_BASE] = -1;

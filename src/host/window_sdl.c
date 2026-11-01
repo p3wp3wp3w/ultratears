@@ -56,6 +56,13 @@ static void pad_update(void) {
             {SDL_GAMEPAD_BUTTON_DPAD_DOWN, 32768}};
         for (unsigned i = 0; i < sizeof map / sizeof *map; i++)
             if (SDL_GetGamepadButton(pad, map[i].b)) s.buttons |= map[i].bit;
+        // Optional Xbox-letter layout: physical A/B/X/Y match the game's letters.
+        const char *layout = getenv("TOTK_CONTROLLER_LAYOUT");
+        if (layout && !strcmp(layout, "xbox-letters")) {
+            uint64_t face = s.buttons & 15;
+            s.buttons = (s.buttons & ~UINT64_C(15)) | ((face & 1) << 1) | ((face & 2) >> 1)
+                      | ((face & 4) << 1) | ((face & 8) >> 1);
+        }
         if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384) s.buttons |= 256;
         if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384) s.buttons |= 512;
         s.lx = stick(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), 0);
@@ -92,7 +99,10 @@ int window_init(void) {
         return 0;
     }
     pad_lock = SDL_CreateMutex();
-    window = SDL_CreateWindow("UltraTears", 1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    const char *fullscreen = getenv("TOTK_FULLSCREEN");
+    if (fullscreen && strcmp(fullscreen, "0")) flags |= SDL_WINDOW_FULLSCREEN;
+    window = SDL_CreateWindow("UltraTears", 1280, 720, flags);
     if (!window) { fprintf(stderr, "[totk] window: %s\n", SDL_GetError()); return 0; }
     if (!vkp_init(window))
         runtime_fail("Vulkan initialization failed (Vulkan 1.3 with VK_EXT_shader_object is required)");
@@ -139,6 +149,20 @@ static void open_pad(SDL_JoystickID id) {
     }
     SDL_UnlockMutex(pad_lock);
     pad_update();
+}
+// A wired connection and its receiver may be separate devices. Select the one
+// generating deliberate input, rather than letting an idle first device win.
+static void select_pad(SDL_JoystickID id) {
+    SDL_LockMutex(pad_lock);
+    if (!pad || SDL_GetGamepadID(pad) != id) {
+        SDL_Gamepad *next = SDL_OpenGamepad(id);
+        if (next) {
+            if (pad) SDL_CloseGamepad(pad);
+            pad = next;
+            pad_attached();
+        }
+    }
+    SDL_UnlockMutex(pad_lock);
 }
 static void close_pad(SDL_JoystickID id) {
     SDL_LockMutex(pad_lock);
@@ -221,7 +245,17 @@ _Noreturn void window_loop(void) {
                 case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: vkp_resized(); break;
                 case SDL_EVENT_GAMEPAD_ADDED: open_pad(e.gdevice.which); break;
                 case SDL_EVENT_GAMEPAD_REMOVED: close_pad(e.gdevice.which); break;
-                case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+                case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+                    if ((e.gaxis.axis < SDL_GAMEPAD_AXIS_LEFT_TRIGGER && abs((int)e.gaxis.value) > 8000) ||
+                        (e.gaxis.axis >= SDL_GAMEPAD_AXIS_LEFT_TRIGGER && e.gaxis.value > 16384))
+                        select_pad(e.gaxis.which);
+                    pad_update();
+                    break;
+                case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                    select_pad(e.gbutton.which);
+                    pad_update();
+                    break;
+                case SDL_EVENT_GAMEPAD_BUTTON_UP:
                     pad_update();
                     break;
                 case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: pad_sensor(&e.gsensor); break;

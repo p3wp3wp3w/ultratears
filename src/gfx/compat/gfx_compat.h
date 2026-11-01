@@ -95,21 +95,27 @@ static inline int pthread_get_qos_class_np(pthread_t t, qos_class_t *q, int *r) 
 #ifndef SIGBUS
 #define SIGBUS 10
 #endif
+#ifndef __linux__
 typedef jmp_buf sigjmp_buf;
 #define sigsetjmp(b, m) setjmp(b)
 #define siglongjmp(b, v) longjmp(b, v)
+#endif
 
 // ---- resource usage (statistics only)
+#ifdef __linux__
+#include <sys/resource.h>
+#else
 struct rusage { struct { long tv_sec, tv_usec; } ru_utime, ru_stime; long ru_maxrss, ru_minflt, ru_majflt, ru_nvcsw, ru_nivcsw; };
 #define RUSAGE_SELF 0
 static inline int getrusage(int who, struct rusage *r) { (void)who; memset(r, 0, sizeof *r); return -1; }
+#endif
 
 // ---- memory
 #ifdef __linux__
 #define malloc_size(p) malloc_usable_size(p)
+#include <sys/mman.h>
 #else
 #define malloc_size(p) _msize(p)
-#endif
 #define PROT_NONE 0
 #define PROT_READ 1
 #define PROT_WRITE 2
@@ -119,7 +125,6 @@ static inline int getrusage(int who, struct rusage *r) { (void)who; memset(r, 0,
 static inline void *mmap(void *a, size_t n, int p, int f, int fd, long o) { (void)a; (void)n; (void)p; (void)f; (void)fd; (void)o; return MAP_FAILED; }
 static inline int munmap(void *a, size_t n) { (void)a; (void)n; return -1; }
 static inline int mprotect(void *a, size_t n, int p) { (void)a; (void)n; (void)p; return -1; }
-#ifndef __linux__
 static inline int getpagesize(void) { return 4096; }
 #endif
 

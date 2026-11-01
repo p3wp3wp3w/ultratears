@@ -46,8 +46,9 @@ static void load(void) {
     for (int i = 0; i < SHARED_FONT_COUNT; i++) {
         need(fread(region + at, 1, sizes[i], f[i]) == sizes[i], "shared font read");
         fclose(f[i]);
-        // BFTTF header: magic and size, each XORed with the same key; the magic decodes to 0x18029a7f.
-        uint32_t key = be32(region + at) ^ 0x18029a7fu, n = be32(region + at + 4) ^ key;
+        // BFTTF stores big-endian words: the decoded magic is 0x7f9a0218
+        // (0x18029a7f is its little-endian interpretation).
+        uint32_t key = be32(region + at) ^ 0x7f9a0218u, n = be32(region + at + 4) ^ key;
         need(n == sizes[i] - 8, "shared font BFTTF header");
         offsets[i] = at + 8;
         font_bytes[i] = n;

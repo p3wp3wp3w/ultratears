@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
+#include <stddef.h>
 #include <stdint.h>
 #ifndef _WIN32
+#include <errno.h>
 #include <sys/mman.h>
 #define MEM_RESERVE 0x2000
 #define MEM_COMMIT 0x1000
@@ -16,10 +18,10 @@ static inline void *VirtualAlloc(void *addr, size_t size, int type, int prot) {
     return (res == MAP_FAILED) ? NULL : res;
 }
 static inline int VirtualFree(void *addr, size_t size, int type) {
-    (void)size; (void)type;
-    return munmap(addr, size);
+    (void)type;
+    return munmap(addr, size) == 0;
 }
-static inline unsigned long GetLastError(void) { return 0; }
+static inline unsigned long GetLastError(void) { return (unsigned long)errno; }
 #endif
 // [Windows port] NVN physical / virtual memory pools (the API of MacNativeGames' totk_vpool.h).
 // MacNativeGames maps a virtual pool's 64 KiB pages onto physical pools' pages a second time (mach_vm_remap). Windows
@@ -92,7 +94,11 @@ int totk_vpool_fini(pool_t *o) {
         if ((*p)->pool == o) { vtable *t = *p; *p = t->next; free(t->pages); free(t); break; }
     pthread_mutex_unlock(&g_map_mu);
     if (o->flags & F_PHYSICAL) { atomic_fetch_sub(&g_host_bytes, o->span); atomic_fetch_sub(&g_host_pools, 1); }
+#ifdef _WIN32
     VirtualFree(o->host, 0, MEM_RELEASE);
+#else
+    VirtualFree(o->host, o->span, MEM_RELEASE);
+#endif
     o->host = NULL; o->mem = o->game_mem; o->span = 0;
     return 1;
 }

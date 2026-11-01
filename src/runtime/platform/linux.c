@@ -9,6 +9,7 @@
 #include <linux/userfaultfd.h>
 #include <pthread.h>
 #include <sched.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -185,6 +186,7 @@ static void log_to_file_without_terminal(void) {
     snprintf(g_log_path, sizeof g_log_path, "%s/ultratears.log", dir);
     bool append = getenv("TOTK_LOG_APPEND") != NULL;
     if (!freopen(g_log_path, append ? "a" : "w", stderr)) { g_log_path[0] = 0; return; }
+    setvbuf(stderr, NULL, _IONBF, 0);
     dup2(STDERR_FILENO, STDOUT_FILENO);
     setenv("TOTK_LOG_APPEND", "1", 1);
 }
@@ -286,7 +288,15 @@ void plat_print_backtrace(void) {
     }
 }
 
+extern __thread sigjmp_buf *runtime_fault_guard;
+
 static void crash_handler(int sig, siginfo_t *si, void *ctx) {
+    // Graphics probes explicitly install a recovery point for stale guest pages.
+    if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_guard) {
+        sigjmp_buf *guard = runtime_fault_guard;
+        runtime_fault_guard = NULL;
+        siglongjmp(*guard, 1);
+    }
     ucontext_t *uc = ctx;
     static volatile int depth;
     if (sig == SIGABRT && depth++ > 0) { signal(SIGABRT, SIG_DFL); abort(); }  // (nested: just die)

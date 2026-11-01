@@ -21,6 +21,8 @@ not while you play.
 
 ## Status
 
+Experimental Linux build instructions and local debugging mode: [BUILDING-LINUX.md](BUILDING-LINUX.md).
+
 Early. Measured on the developer's PC (Windows 10, Ryzen, 16 threads, GeForce RTX 3060):
 
 | What | Result |
