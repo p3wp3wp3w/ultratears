@@ -32,7 +32,7 @@ python3 tools/debug_run.py --game dist/ultratears --log-root ~/.local/share/ultr
 
 The local desktop setup supplies **UltraTears (Debug)**, plus **Debug Mode** and **Open Logs** actions on the normal shortcut. Normal and debug launches share the selected save profile; the launcher prevents simultaneous sessions for that profile.
 
-Each debug session has `session.json`, `debugger.log` and the game's `ultratears.log`. `debug-latest` points to the latest session. The runner enables the game's statistics, preserves expected guarded memory probes, and captures all-thread backtraces for unhandled faults before terminating the failed process. GDB startup scripts and debuginfod downloads are disabled. Without GDB, statistics/logging still work but automatic symbolic crash capture is unavailable. Logs remain local and are not uploaded.
+Each debug session has `session.json`, `debugger.log` and the game's `ultratears.log`. `debug-latest` points to the latest session. The runner enables the game's statistics, preserves expected guarded memory probes, and captures all-thread backtraces for unhandled faults before terminating the failed process. When guest CPU state is available, `guest-state.json` and bounded memory blocks capture nearby guest objects (at most 256 KiB). These blocks are private, may contain game-derived data, and must not be committed or shared. GDB startup scripts and debuginfod downloads are disabled. Without GDB, statistics/logging still work but automatic symbolic crash capture is unavailable. Logs remain local and are not uploaded.
 
 ## Validation and source history
 

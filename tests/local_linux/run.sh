@@ -10,6 +10,8 @@ graphics=(-I"$root/src/gfx" -I"$root/src/gfx/nvn" -I"$root/src/gfx/nvn/include" 
 "$output/vpool"
 "$cc" "${common[@]}" "${graphics[@]}" "$root/tests/local_linux/posix.c" -o "$output/posix" -lpthread
 "$output/posix"
+"$cc" "${common[@]}" "$root/tests/local_linux/guest_memory.c" -o "$output/guest_memory" -lpthread
+"$output/guest_memory"
 "$cc" "${common[@]}" "$root/tests/local_linux/romfs.c" -o "$output/romfs" -lpthread
 "$output/romfs"
 "$cc" "${common[@]}" "$root/tests/local_linux/fault_guard.c" -o "$output/fault_guard" -lpthread -ldl
@@ -21,7 +23,7 @@ else
 fi
 "$cc" "${common[@]}" "$root/tests/local_linux/controller.c" -o "$output/controller" "${sdl_flags[@]}" -lpthread
 "$output/controller"
-printf '%s\n' 'Linux memory-pool, POSIX signal/resource, missing-file, fault-guard, and controller regression checks passed.'
+printf '%s\n' 'Linux memory-pool, guest-page reuse, POSIX signal/resource, missing-file, fault-guard, and controller regression checks passed.'
 
 if command -v gdb >/dev/null; then
     python3 "$root/tests/local_linux/debug_runner.py"

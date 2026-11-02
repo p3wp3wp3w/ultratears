@@ -10,9 +10,9 @@
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
-#ifdef _WIN32
 #include <windows.h>
-#endif
+#else
+#include <sys/mman.h>
 #endif
 
 #include "host.h"
@@ -46,7 +46,10 @@ static void decommit(uint64_t addr, uint64_t size) {
 #ifdef _WIN32
     if (size && !VirtualFree((void *)(uintptr_t)addr, size, MEM_DECOMMIT)) runtime_fail("decommit guest pages");
 #else
-    (void)addr; (void)size;
+    // Keep the reserved guest addresses, but discard their anonymous backing.
+    // A subsequent map must see fresh zero pages, not the previous allocation.
+    if (size && madvise((void *)(uintptr_t)addr, (size_t)size, MADV_DONTNEED))
+        runtime_fail("decommit guest pages");
 #endif
 }
 

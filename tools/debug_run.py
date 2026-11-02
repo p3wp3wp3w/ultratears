@@ -10,9 +10,23 @@ import subprocess
 import time
 
 
-def debugger_script():
+def debugger_script(state_directory=None):
     # Addresses and backtraces stay local. Expected guarded graphics probes must
     # reach the game's signal handler, rather than being reported as crashes.
+    state_capture = ''
+    if state_directory is not None:
+        module = Path(__file__).with_name('debug_state.py')
+        state_capture = '''python
+try:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('ultrs_debug_state', %r)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.capture(%r)
+except Exception:
+    print('Guest-state capture unavailable; retaining the standard backtrace')
+end
+''' % (str(module), str(state_directory))
     return """set pagination off
 set confirm off
 set debuginfod enabled off
@@ -49,7 +63,7 @@ except (gdb.error, ValueError):
     code = 1
 gdb.execute('quit %d' % code)
 end
-"""
+""".replace('thread apply all bt 12', state_capture + 'thread apply all bt 12')
 
 
 def main():
@@ -78,7 +92,7 @@ def main():
     command = [str(game), '--debug', *arguments]
     if debugger:
         script = session / 'commands.gdb'
-        script.write_text(debugger_script())
+        script.write_text(debugger_script(session))
         command = [debugger, '--nx', '--batch', '-x', str(script), '--args', *command]
     metadata = {'started_utc': now.isoformat(), 'mode': 'debug',
                 'debugger': bool(debugger), 'game': str(game), 'session': str(session),
