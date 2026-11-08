@@ -79,3 +79,19 @@ existing absent-actor branch, which clears the output reference. This guards
 the captured call into a self-linked heap object; the underlying object
 lifetime problem is still under investigation. The patch checks the original
 instruction word and rejects mismatched game code.
+
+### Crash paths under investigation
+
+| Path | Evidence and status |
+| --- | --- |
+| `backend_vk.c`: `ub_write`, `mt_record` | Captured Radeon faults while writing/finalizing command streams. Staged updates alone did not eliminate the failure. Driver comparison remains relevant. |
+| `vkb_shader.c`: `make_layouts` | Confirmed partial-publication race; fixed and covered by a concurrent-reader test. |
+| `present.c`: swapchain recreation | Validation caught presentation semaphores destroyed while in use; queue-drain fix added. |
+| `vkb_draw.c`: `set_vertex_input` | Validation identified an overlapping-attribute stride restriction; native vertex input should set that stride itself. |
+| Actor-reference callback | Captured indirect call into a self-linked heap object. The targeted guard passes saved-state replay; the underlying object lifetime remains unresolved. |
+
+These are crash investigations, not evidence of malicious code. Review of the
+updater and dependency installer found the same code as released upstream
+v0.3.1, with hash checks on downloads. A live game-process snapshot showed no
+internet sockets or open private credential/archive files. This is a scoped
+source and runtime review, not a guarantee about every dependency or execution.

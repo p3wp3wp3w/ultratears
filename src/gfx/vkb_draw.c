@@ -1739,11 +1739,14 @@ static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
         VkBuffer buf;
         VkDeviceSize off;
         VkDeviceSize size = S.vbuf[s].size;
-        // The stride goes with the binding too, as well as in vkCmdSetVertexInputEXT below. Without
+        // Native dynamic vertex input sets the stride below. Passing it to
+        // BindVertexBuffers2 as well forbids overlapping attributes (VUID 06209).
+        // Without
         // VK_EXT_vertex_input_dynamic_state (AMD Polaris, Intel HD 600) the Khronos shader object layer turns the vertex
         // input into pipelines with a dynamic stride, which only vkCmdBindVertexBuffers2 sets: bound without it, every
         // stride read 0, each triangle collapsed to a point and nothing was drawn (black screen, RX 570, 2026-10-29).
         VkDeviceSize stride = S.vstream[s].stride;
+        const VkDeviceSize *binding_stride = vkc.has_vertex_input_ds ? NULL : &stride;
         // A base vertex past the end of the game's range: the Switch's GPU reads on through game memory. TOTK's Depths
         // terrain draws index ~75 MiB past a 2 MiB vertex buffer, into the next pool; the vertices read as zeros and the
         // triangles shot out as shards (L20). The range the draw reads, imported across pools when it must be.
@@ -1752,13 +1755,13 @@ static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
             if (vkb_gpu_addr(S.vbuf[s].address, need, &buf, &off)) size = need;
             else if (vkb_pool_room(S.vbuf[s].address) && vkb_span_addr(S.vbuf[s].address, need, &buf, &off)) {
                 VkDeviceSize key[4] = {(VkDeviceSize)(uintptr_t)buf, off, need, stride};
-                if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &buf, &off, &need, &stride);
+                if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &buf, &off, &need, binding_stride);
                 continue;
             }
         }
         if (S.vbuf[s].address && size && vkb_gpu_addr(S.vbuf[s].address, size, &buf, &off)) {
             VkDeviceSize key[4] = {(VkDeviceSize)(uintptr_t)buf, off, size, stride};
-            if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &buf, &off, &size, &stride);
+            if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &buf, &off, &size, binding_stride);
         }
         else {
             if (S.vbuf[s].address) {   // [temporary] not in an imported pool (a virtual pool: sparse binding later): zeros
@@ -1769,7 +1772,7 @@ static void set_vertex_input(VkCommandBuffer cb, uint32_t int_inputs) {
                          (unsigned long long)S.vbuf[s].size, s, (unsigned long long)vkb_frame());
             }
             VkDeviceSize z = 0, zs = 65536, key[4] = {(VkDeviceSize)(uintptr_t)g_zero, 0, 65536, stride};
-            if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &g_zero, &z, &zs, &stride);
+            if (dyn(D_VB0 + (int)s, key, sizeof key)) vk.vkCmdBindVertexBuffers2(cb, s, 1, &g_zero, &z, &zs, binding_stride);
         }
     }
     struct { uint32_t nb, na; VkVertexInputBindingDescription2EXT b[16]; VkVertexInputAttributeDescription2EXT a[16]; } vi;

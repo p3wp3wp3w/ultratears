@@ -30,6 +30,8 @@ graphics=(-I"$root/src/gfx" -I"$root/src/gfx/nvn" -I"$root/src/gfx/nvn/include" 
 "$output/shader_layouts"
 "$cc" "${common[@]}" "${graphics[@]}" "$root/tests/local_linux/present_retire.c" -o "$output/present_retire" -lpthread
 "$output/present_retire"
+"$cc" "${common[@]}" "${graphics[@]}" "$root/tests/local_linux/vertex_stride.c" -o "$output/vertex_stride" -lpthread
+"$output/vertex_stride"
 if sdl_config="$(pkg-config --cflags --libs sdl3 2>/dev/null)"; then
     read -r -a sdl_flags <<< "$sdl_config"
 else
