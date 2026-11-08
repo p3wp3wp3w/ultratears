@@ -63,6 +63,11 @@ with `pthread_once`. Testing with the Vulkan validation layer exposed a null
 layout when a worker observed the first layout before the others existed.
 The concurrent layout regression test holds that initialization window open.
 
+Swapchain recreation drains the shared presentation queue before destroying
+the old presentation semaphores. Waiting only for the rendering fences left
+those semaphores in use, as confirmed by Vulkan validation. This is the
+conventional queue-idle fallback for the existing path without present fences.
+
 Linux AMD buffer updates use the recording thread's fenced, coherent upload
 ring and `vkCmdCopyBuffer`. This avoids the inline `vkCmdUpdateBuffer` path
 where a local RADV crash was captured, while retaining the transfer barriers

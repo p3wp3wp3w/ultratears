@@ -62,6 +62,20 @@ static void destroy_swapchain(void) {
     nimages = 0;
 }
 
+static int retire_swapchain(void) {
+    if (swapchain) {
+        // Render fences do not cover the subsequent vkQueuePresentKHR wait.
+        // This path has no present-fence extension: drain the shared queue
+        // before retiring its presentation semaphores during recreation.
+        vk_queue_lock();
+        VkResult result = vk.vkQueueWaitIdle(vkc.queue);
+        vk_queue_unlock();
+        if (!vk_check(result, "swapchain queue idle")) return 0;
+    }
+    destroy_swapchain();
+    return 1;
+}
+
 // 0: the window has no area now (minimised) — try again later
 static int create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
@@ -206,7 +220,7 @@ void vkp_out_ready(int slot, VkSemaphore timeline, uint64_t value, const int cro
 static int present_one(uint64_t n, unsigned slot, out_t *out) {
     if (atomic_exchange(&resized, 0) || !swapchain) {
         vk.vkWaitForFences(vkc.device, FRAMES, in_flight, VK_TRUE, UINT64_MAX);   // the present thread's own work only
-        destroy_swapchain();
+        if (!retire_swapchain()) return 0;
         if (!create_swapchain()) return 0;
     }
     vk.vkWaitForFences(vkc.device, 1, &in_flight[slot], VK_TRUE, UINT64_MAX);
