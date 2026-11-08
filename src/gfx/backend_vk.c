@@ -1671,6 +1671,22 @@ static void ub_write(VkCommandBuffer cb, uint64_t dst, uint64_t n, const uint8_t
     if (!vkb_gpu_addr(dst, n, &db, &off)) return;
     // vkCmdUpdateBuffer: 4-byte aligned, at most 65536 bytes per call
     if (!(off & 3) && !(n & 3)) {
+#ifdef __linux__
+        // A captured RADV crash was in its inline-update command-stream writer.
+        // Keep the bytes in this recording thread's fenced upload ring instead;
+        // the surrounding transfer barriers and destination ordering stay the same.
+        if (vkc.props.vendorID == 0x1002) {
+            for (uint64_t k = 0; k < n; k += 65536) {
+                VkDeviceSize bytes = n - k < 65536 ? n - k : 65536, source_offset;
+                VkBuffer source;
+                void *mapped = vkb_ring_alloc(bytes, 4, &source, &source_offset);
+                memcpy(mapped, data + k, (size_t)bytes);
+                VkBufferCopy region = {source_offset, off + k, bytes};
+                vk.vkCmdCopyBuffer(cb, source, db, 1, &region);
+            }
+            return;
+        }
+#endif
         for (uint64_t k = 0; k < n; k += 65536) vk.vkCmdUpdateBuffer(cb, db, off + k, n - k < 65536 ? n - k : 65536, data + k);
     } else {
         vkb_audit(A_UPDATE_SKIPPED, NULL);

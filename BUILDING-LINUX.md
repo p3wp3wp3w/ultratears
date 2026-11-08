@@ -48,10 +48,24 @@ On Steam Deck, distant smoke can intermittently appear and disappear during play
 
 ## Release merge, November 8
 
-This integration merges released upstream v0.3.1 into the existing Linux branch. Additional post-release bug fixes and experiments are excluded.
+This integration merges released upstream v0.3.1 into the existing Linux branch. Broad development-branch updates and experiments are excluded; the targeted crash mitigations below were added after local testing captured two failures.
 
 The conflict audit retains native Linux memory/resource/signal headers, guarded fault recovery, correct virtual-pool release lengths, zeroed guest-page reuse, parent TLS/TPIDR inheritance, existing memory-operation and heap overrides, and the existing six-GiB application-pool base. Release support for larger render targets adds its extra allocation above that base. The release's native Linux build pipeline, shader/AMD corrections and performance changes are integrated.
 
 Debug Mode, bounded private crash-state capture, active-controller selection, profile locking, Open Logs and the original fullscreen/60 FPS launch settings remain available. Nintendo/Switch button positions are the default. The debug helper supplies the release's log-file setting from the session directory; it does not embed any user's home directory.
 
 The original native Linux game-build path is available with `ULTRS_NATIVE_LINUX=1` during setup, or `tools/build_game.py --platform linux --native-linux --target ultratears`. It uses the compiler and Ninja on `PATH`, installed SDL3/Opus/libvpx/Zstandard libraries and native headers; dependencies may be supplied with the standard `CPATH`, `LIBRARY_PATH` and `LD_LIBRARY_PATH` variables. No personal paths are embedded. Keep one compiler for every generated object. The verified local environment uses Clang 22.1.2; the release's bundled-toolchain build failed the local save-load check, while the native build reached 3,000 frames with the Player actor present. Both builds used the same audited game/runtime source. The bundled kit remains available for its original cross-build workflow.
+
+### Captured crash mitigations
+
+Linux AMD buffer updates use the recording thread's fenced, coherent upload
+ring and `vkCmdCopyBuffer`. This avoids the inline `vkCmdUpdateBuffer` path
+where a local RADV crash was captured, while retaining the transfer barriers
+and update order. Other platforms and GPU vendors keep their existing path.
+
+The 1.4.3 actor-reference callback at main+0x1aff08 checks that its target is
+a translated function before calling it. An invalid target takes the game's
+existing absent-actor branch, which clears the output reference. This guards
+the captured call into a self-linked heap object; the underlying object
+lifetime problem is still under investigation. The patch checks the original
+instruction word and rejects mismatched game code.

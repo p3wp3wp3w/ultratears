@@ -232,7 +232,17 @@ ZSTD_SITES = {0x5f5358: (0x97e913a6, ZSTD_MULTI), 0x6d7788: (0x97e58a9a, ZSTD_MU
               0x1852314: (0x979f9fb3, ZSTD_DDICT)}
 
 
+def actor_callback(gen, addr):
+    # The failed call was blr x9 with a heap self-link as its target. The
+    # original null-actor branch clears the output reference at +0x1aff14.
+    expect(gen, addr, 0xd63f0120, 'actor_callback')
+    return ('{ extern int totk_actor_callback_ok(uint64_t target); '
+            'if (!totk_actor_callback_ok(c->x[9])) goto L_8001aff14; '
+            f'c->pc = c->x[9]; c->x[30] = {addr + 4:#x}ull; rt_dispatch(c); }}')
+
+
 PATCHES = {
+    MAIN + 0x1aff08: actor_callback,
     MAIN + 0x2b036c: cooldown,
     **{MAIN + a: zstd_call(w, t, 'totk_zstd_multiframe' if t == ZSTD_MULTI else 'totk_zstd_using_ddict')
        for a, (w, t) in ZSTD_SITES.items()},

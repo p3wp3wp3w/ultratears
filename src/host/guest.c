@@ -54,6 +54,18 @@ uint64_t guest_call_args(uint64_t fn, int n, const uint64_t *args) {
     return r;
 }
 
+// The actor-reference path in 1.4.3 can observe a retired actor whose first
+// words have become a self-linked free-list node. Its virtual callback then
+// points into the heap. Use that path's existing absent-actor result instead.
+int totk_actor_callback_ok(uint64_t target) {
+    if (dispatch_lookup(target)) return 1;
+    static unsigned warned;
+    unsigned n = __atomic_fetch_add(&warned, 1, __ATOMIC_RELAXED);
+    if (n < 8)
+        fprintf(stderr, "[totk] stale actor callback rejected; clearing the actor reference\n");
+    return 0;
+}
+
 // Every `svc #imm` of the recompiled code lands here (cpu.h).
 void runtime_core_checkpoint(void);   // threads.c: give the core up to a better waiting thread
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) { runtime_core_checkpoint(); runtime_svc(imm, c->x, pc); }
