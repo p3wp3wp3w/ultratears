@@ -19,7 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import deps_install  # noqa: E402
 import icon_png  # noqa: E402
-from toolchain import CLANG64, env as tool_env  # noqa: E402
+from toolchain import CLANG64, exe as exe_name, env as tool_env  # noqa: E402
 import version  # noqa: E402
 
 EXE = 'UltraTears Launcher.exe'
@@ -153,7 +153,7 @@ def main():
         lines.append(f'  pdb = {b}/UltraTears-Launcher.pdb')
     lines.append(f'default {exe}')
     write_if_changed(build / 'build.ninja', ('\n'.join(lines) + '\n').encode())
-    rc = subprocess.run([str(CLANG64 / 'ninja.exe'), '-C', str(ROOT), '-f', str(build / 'build.ninja')], env=tool_env()).returncode
+    rc = subprocess.run([str(CLANG64 / exe_name('ninja')), '-C', str(ROOT), '-f', str(build / 'build.ninja')], env=tool_env()).returncode
     if rc == 0:
         print(f'{build / name}')
     sys.exit(rc)
