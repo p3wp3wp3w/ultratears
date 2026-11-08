@@ -78,7 +78,9 @@ def main():
         parser.error('game executable is missing or is not executable')
     arguments = args.arguments[1:] if args.arguments[:1] == ['--'] else args.arguments
     now = dt.datetime.now(dt.timezone.utc)
-    log_root = args.log_root or Path(os.environ.get('LARECOMP_DATA_ROOT', Path.home() / '.local/share/UltraTears/logs'))
+    data_home = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share'))
+    profile = Path(os.environ.get('TOTK_PROFILE_DIR', data_home / 'UltraTears'))
+    log_root = args.log_root or Path(os.environ.get('LARECOMP_DATA_ROOT', profile / 'logs'))
     log_root = log_root.expanduser().resolve()
     session = log_root / ('debug-' + now.strftime('%Y%m%dT%H%M%S.%fZ') + '-' + str(os.getpid()))
     session.mkdir(parents=True, mode=0o700)

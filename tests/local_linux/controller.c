@@ -18,6 +18,13 @@ int main(void) {
  open_pad(first); assert(SDL_GetGamepadID(pad) == first);
  SDL_Joystick *j = SDL_OpenJoystick(second); assert(j);
  select_pad(second); assert(SDL_GetGamepadID(pad) == second);
+ setenv("TOTK_CONTROLLER_LAYOUT", "switch", 1);
+ const unsigned default_bits[] = {2, 1, 8, 4};
+ for (int button = 0; button < 4; button++) {
+  assert(SDL_SetJoystickVirtualButton(j, button, true)); SDL_UpdateJoysticks(); pad_update();
+  assert(observed.buttons == default_bits[button]);
+  assert(SDL_SetJoystickVirtualButton(j, button, false)); SDL_UpdateJoysticks();
+ }
  setenv("TOTK_CONTROLLER_LAYOUT", "xbox-letters", 1);
  for (int button = 0; button < 4; button++) {
   assert(SDL_SetJoystickVirtualButton(j, button, true)); SDL_UpdateJoysticks(); pad_update();
