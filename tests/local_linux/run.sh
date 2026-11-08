@@ -26,6 +26,8 @@ graphics=(-I"$root/src/gfx" -I"$root/src/gfx/nvn" -I"$root/src/gfx/nvn/include" 
 "$output/buffer_updates"
 "$cc" "${common[@]}" "${graphics[@]}" "$root/tests/local_linux/actor_callback.c" -o "$output/actor_callback" -lpthread
 "$output/actor_callback"
+"$cc" "${common[@]}" "${graphics[@]}" "$root/tests/local_linux/shader_layouts.c" -o "$output/shader_layouts" -lpthread
+"$output/shader_layouts"
 if sdl_config="$(pkg-config --cflags --libs sdl3 2>/dev/null)"; then
     read -r -a sdl_flags <<< "$sdl_config"
 else

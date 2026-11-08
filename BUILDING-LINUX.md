@@ -58,6 +58,11 @@ The original native Linux game-build path is available with `ULTRS_NATIVE_LINUX=
 
 ### Captured crash mitigations
 
+Shader workers wait for descriptor and pipeline layouts to be fully initialized
+with `pthread_once`. Testing with the Vulkan validation layer exposed a null
+layout when a worker observed the first layout before the others existed.
+The concurrent layout regression test holds that initialization window open.
+
 Linux AMD buffer updates use the recording thread's fenced, coherent upload
 ring and `vkCmdCopyBuffer`. This avoids the inline `vkCmdUpdateBuffer` path
 where a local RADV crash was captured, while retaining the transfer barriers

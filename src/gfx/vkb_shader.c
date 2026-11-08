@@ -40,6 +40,7 @@
 // Layouts (VKB_LAYOUT_*): graphics, compute, and with split sets the graphics buffers' (set 1).
 static VkDescriptorSetLayout g_layout[VKB_LAYOUTS];
 static VkPipelineLayout g_playout[2];
+static pthread_once_t g_layout_once = PTHREAD_ONCE_INIT;
 
 // Graphics descriptors in two sets (descriptor buffers only): set 0 the textures and images, set 1 the buffers. A draw's
 // textures are those of the draw before ~76 % of the time, its buffers ~6 % (uniform offsets per object; Lookout Landing
@@ -51,6 +52,14 @@ int vkb_split_sets(void) {
     return v;
 }
 static int is_buffer_binding(uint32_t b) { return b % VKB_STAGE_BINDINGS < VKB_B_TEX; }
+
+// Only called after every set layout exists, including from make_layouts itself.
+static uint32_t ready_set_layouts(int compute, VkDescriptorSetLayout out[2]) {
+    out[0] = g_layout[compute];
+    if (compute || !vkb_split_sets()) return 1;
+    out[1] = g_layout[VKB_LAYOUT_BUFFERS];
+    return 2;
+}
 
 static void make_layouts(void) {
     for (int id = 0; id < VKB_LAYOUTS; id++) {
@@ -82,21 +91,18 @@ static void make_layouts(void) {
     }
     for (int compute = 0; compute < 2; compute++) {
         VkDescriptorSetLayout sets[2];
-        uint32_t n = vkb_set_layouts(compute, sets);
+        uint32_t n = ready_set_layouts(compute, sets);
         VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = n, .pSetLayouts = sets};
         if (!vk_check(vk.vkCreatePipelineLayout(vkc.device, &pi, NULL, &g_playout[compute]), "pipeline layout")) die("layout");
     }
     if (vkb_db_on()) vkb_db_layouts(g_layout);
 }
-VkDescriptorSetLayout vkb_set_layout(int compute) { if (!g_layout[0]) make_layouts(); return g_layout[compute]; }
+VkDescriptorSetLayout vkb_set_layout(int compute) { pthread_once(&g_layout_once, make_layouts); return g_layout[compute]; }
 uint32_t vkb_set_layouts(int compute, VkDescriptorSetLayout out[2]) {   // a pipeline's sets: their count
-    if (!g_layout[0]) make_layouts();
-    out[0] = g_layout[compute];
-    if (compute || !vkb_split_sets()) return 1;
-    out[1] = g_layout[VKB_LAYOUT_BUFFERS];
-    return 2;
+    pthread_once(&g_layout_once, make_layouts);
+    return ready_set_layouts(compute, out);
 }
-VkPipelineLayout vkb_pipeline_layout(int compute) { if (!g_layout[0]) make_layouts(); return g_playout[compute]; }
+VkPipelineLayout vkb_pipeline_layout(int compute) { pthread_once(&g_layout_once, make_layouts); return g_playout[compute]; }
 
 // ---------------- the reflection (<key>.res.json): a small reader for its fixed shape ----------------
 static const char *json_array(const char *j, const char *name) {   // just after the '[' of "name": [
