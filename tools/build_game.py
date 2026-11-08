@@ -11,6 +11,7 @@ executables go to build/; neither is ever in git.
 import argparse
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -54,6 +55,13 @@ LINUX_KIT = pathlib.Path(os.environ.get('ULTRS_LINUX_KIT') or next(
     (p for p in (ROOT / 'deps/linux', ROOT / 'dev-local/linux-cross') if (p / 'sysroot').is_dir()), ROOT / 'deps/linux'))
 LINUX_RUNTIME = ['src/runtime/dispatch.c', 'src/runtime/loader.c', 'src/runtime/platform/linux.c', 'src/runtime/logcost.c', 'src/runtime/fma.c',
                  'src/runtime/envcache.c']
+NATIVE_LINUX = False
+
+
+def build_env():
+    if NATIVE_LINUX:
+        return dict(os.environ, PATH=str(CLANG64) + os.pathsep + os.environ.get('PATH', ''))
+    return tool_env()
 
 
 # The rpath of the Linux programs, as ninja writes it into a command: on Linux ninja runs commands through sh, which
@@ -63,11 +71,17 @@ RPATH = '$$ORIGIN' if os.name == 'nt' else "'$$ORIGIN'"
 
 
 def linux_flags():
+    if NATIVE_LINUX:
+        return ''
     kit = LINUX_KIT.as_posix()
     return f'--target=x86_64-linux-gnu --sysroot={kit}/sysroot -I{kit}/include'
 
 
 def linux_libs():
+    if NATIVE_LINUX:
+        return ('-Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc '
+                '-Wl,--wrap=getenv,--wrap=setenv,--wrap=unsetenv,--wrap=putenv '
+                '-Lbuild/lib -lSDL3 -lopus -lvpx -lzstd -lpthread -ldl -lm -lstdc++')
     # SDL3 shared (beside the game: the sysroot's static one is not position-independent); Opus, libvpx, zstd and
     # libstdc++ static, so the game needs only glibc, the Vulkan loader and that SDL3.
     return (f'-L{LINUX_KIT.as_posix()}/lib -Wl,--wrap=fprintf,--wrap=vfprintf,--wrap=fputs,--wrap=fputc '
@@ -150,7 +164,7 @@ def cpu_arch():
     x86-64-v2 (SSE4.2): the code is built on the player's PC, so for its CPU (issue #19: i7-3770, Xeon E3-1230 v2).
     clang -march=native says which features the CPU has."""
     r = subprocess.run([str(CLANG64 / exe('clang')), '-march=native', '-dM', '-E', '-x', 'c', os.devnull], capture_output=True,
-                       text=True, env=tool_env())
+                       text=True, env=build_env())
     if r.returncode:
         print('cannot ask clang about this CPU: building for x86-64-v3', flush=True)
         return 'x86-64-v3'
@@ -159,6 +173,7 @@ def cpu_arch():
 
 
 def main():
+    global CLANG64, NATIVE_LINUX
     ap = argparse.ArgumentParser()
     ap.add_argument('--generated', default='data/generated')
     ap.add_argument('--target', default='probe_cpu')
@@ -169,9 +184,20 @@ def main():
     ap.add_argument('--platform', default='windows' if os.name == 'nt' else 'linux', choices=['windows', 'linux'],
                     help='linux: cross-compile the game for Linux / Steam Deck (the Linux kit, LINUX_KIT)')
     ap.add_argument('--runtime-only', action='store_true', help='compile our runtime only, not the game code (porting)')
+    ap.add_argument('--native-linux', action='store_true', default=os.environ.get('ULTRS_NATIVE_LINUX') == '1',
+                    help='use the original native Linux compiler and libraries from PATH (also ULTRS_NATIVE_LINUX=1)')
     a = ap.parse_args()
     linux = a.platform == 'linux'
-    if linux and not (LINUX_KIT / 'sysroot').is_dir():
+    NATIVE_LINUX = linux and a.native_linux
+    if a.native_linux and (not linux or os.name == 'nt'):
+        sys.exit('--native-linux requires a Linux host and target')
+    if NATIVE_LINUX:
+        missing = [n for n in ('clang', 'clang++', 'ninja', 'ld.lld') if not shutil.which(n)]
+        if missing:
+            sys.exit('native Linux build tools missing: ' + ', '.join(missing))
+        CLANG64 = pathlib.Path(shutil.which('clang')).parent
+        print('Native Linux build: compiler and libraries from the host environment', flush=True)
+    if linux and not NATIVE_LINUX and not (LINUX_KIT / 'sysroot').is_dir():
         sys.exit(f'the Linux kit is missing ({LINUX_KIT})')
     if not linux and os.name != 'nt':
         sys.exit('the game for Windows is built on Windows')
@@ -186,7 +212,7 @@ def main():
         print(f'code for {arch}: this CPU has no AVX2 / FMA / BMI2 (slower than x86-64-v3)', flush=True)
     a.j = a.j or min(a.cpus, jobs_for_ram())
     gen = ROOT / a.generated
-    bd = 'build-linux' if linux else 'build'
+    bd = 'build-native22' if NATIVE_LINUX else 'build-linux' if linux else 'build'
     build = ROOT / bd
     build.mkdir(exist_ok=True)
     link = (f'  command = clang {linux_flags()} --rtlib=libgcc --unwindlib=libgcc -fuse-ld=lld -no-pie -g '
@@ -264,8 +290,7 @@ def main():
         lines.append(f'  pdb = build/{pathlib.Path(out).stem}.pdb')
     lines.append(f'default {" ".join(objs) if a.runtime_only else out}')
     (build / 'build.ninja').write_text('\n'.join(lines) + '\n')
-    if linux:   # SDL3 beside the game (rpath $ORIGIN)
-        import shutil
+    if linux and not NATIVE_LINUX:   # the kit's SDL3 beside the game; native builds use installed libraries
         (ROOT / 'linux').mkdir(exist_ok=True)
         # the Linux kit has libSDL3.so.0 itself (its links made copies, tools/make_linux_kit.py); a full sysroot has it
         # as a link to libSDL3.so.0.<version>, which Windows may have extracted as a copy or not at all
@@ -275,13 +300,12 @@ def main():
         if not sdl:
             sys.exit(f'libSDL3.so.0 is missing from the Linux kit ({lib}): the game for Linux needs it beside itself')
         shutil.copy2(sdl, ROOT / 'linux/libSDL3.so.0')
-    env = tool_env()
+    env = build_env()
     # Another compiler (an update brought another LLVM): ninja sees the same command lines and would keep the objects
     # the old one made, so they go and everything is compiled by the new one.
     cc = subprocess.run([str(CLANG64 / exe('clang')), '--version'], capture_output=True, text=True, env=env).stdout.split('\n')[0]
     stamp = build / 'compiler.txt'
     if stamp.is_file() and stamp.read_text(encoding='utf-8').strip() != cc.strip():
-        import shutil
         print(f'another compiler ({cc.strip()}): compiling everything again', flush=True)
         for sub in ('obj', 'game'):
             shutil.rmtree(build / sub, ignore_errors=True)
@@ -289,7 +313,8 @@ def main():
     print(f'{len(game_objs)} generated files, {len(objs)} runtime files', flush=True)
     # The user works on this PC during builds: ninja starts suspended, gets the first --cpus logical CPUs and
     # below-normal priority, then runs; every clang it starts inherits both, so the other CPUs stay free.
-    ninja = [str(CLANG64 / exe('ninja')), '-C', str(ROOT), '-f', f'{bd}/build.ninja', f'-j{a.j}', '-k', '0']
+    ninja_bin = shutil.which('ninja') if NATIVE_LINUX else str(CLANG64 / exe('ninja'))
+    ninja = [ninja_bin, '-C', str(ROOT), '-f', f'{bd}/build.ninja', f'-j{a.j}', '-k', '0']
     on_line = None
     import progress
     if progress.JSON:   # setup.py --json: ninja's [n/m] as progress events, its lines on to the log
