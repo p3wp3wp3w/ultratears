@@ -9,6 +9,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -16,6 +17,9 @@
 #include <unistd.h>
 #endif
 
+#ifndef _WIN32
+static int g_instance_fd = -1;   // the one-instance lock (flock), close-on-exec: the game and the builder do not hold it
+#endif
 #ifdef _WIN32
 static HANDLE g_instance;   // the one-instance mutex
 
@@ -33,6 +37,35 @@ std::string exe_dir() {
     while (d.size() > 1 && (d.back() == '/' || d.back() == '\\'))
         d.pop_back();
     return d;
+}
+
+// Started from an AppImage the launcher's folder is the image's read-only mount (gone when it exits): its settings and
+// the game go beside the AppImage file instead ($APPIMAGE, set by the AppImage runtime).
+static std::string appimage_dir() {
+#ifdef _WIN32
+    return "";
+#else
+    const char *a = SDL_getenv("APPIMAGE");
+    if (!a || !*a)
+        return "";
+    std::string d = a;
+    size_t cut = d.find_last_of('/');
+    return cut == std::string::npos ? std::string(".") : cut == 0 ? std::string("/") : d.substr(0, cut);
+#endif
+}
+std::string own_dir() {
+    std::string d = appimage_dir();
+    return d.empty() ? exe_dir() : d;
+}
+// The package's own folder; from an AppImage: the folder of a game beside it (the AppImage put in a game folder to
+// update it, as one from a Steam Deck's tar), else a new UltraTears folder there.
+std::string default_install() {
+    std::string d = appimage_dir();
+    if (d.empty())
+        return exe_dir();
+    if (path_is_file(path_join(d, "ultratears.cfg")))
+        return d;
+    return path_join(d, "UltraTears");
 }
 
 std::string path_join(const std::string &a, const std::string &b) {
@@ -120,11 +153,22 @@ bool single_instance(const char *title) {
     }
     return false;
 #else
-    (void)title;
+    // The lock held by another process: a launcher is running (its window is not raised here: no portable way).
+    // Before 2026-11-01 the descriptor was inherited by the game and the builder the launcher starts, so a game still
+    // running (or a build) kept the next launcher from starting at all, silently (Steam Deck, Game Mode).
     const char *run = SDL_getenv("XDG_RUNTIME_DIR");
     std::string lock = std::string(run ? run : "/tmp") + "/ultratears-launcher.lock";
-    int fd = open(lock.c_str(), O_CREAT | O_RDWR, 0600);
-    return fd < 0 || flock(fd, LOCK_EX | LOCK_NB) == 0;   // the descriptor stays open while the launcher runs
+    int fd = open(lock.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return true;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        SDL_Log("another launcher is running (%s is locked): this one ends", lock.c_str());
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, title, T("already_running"), nullptr);
+        return false;
+    }
+    g_instance_fd = fd;   // stays open while the launcher runs
+    return true;
 #endif
 }
 
@@ -155,7 +199,7 @@ Lang system_lang() {
 int logical_cpus() { return SDL_max(1, SDL_GetNumLogicalCPUCores()); }
 
 // ---- settings: ultratears-launcher.ini next to the launcher, key=value lines in UTF-8
-static std::string settings_path() { return path_join(exe_dir(), "ultratears-launcher.ini"); }
+static std::string settings_path() { return path_join(own_dir(), "ultratears-launcher.ini"); }
 
 Settings settings_load() {
     Settings s;
@@ -210,6 +254,10 @@ void single_instance_release() {
     if (g_instance)
         CloseHandle(g_instance);
     g_instance = nullptr;
+#else
+    if (g_instance_fd >= 0)
+        close(g_instance_fd);
+    g_instance_fd = -1;
 #endif
 }
 
@@ -229,25 +277,115 @@ bool restart_self() {
     CloseHandle(pi.hProcess);
     return true;
 #else
-    return false;   // [temporary] Linux: execv(/proc/self/exe) once there is a Linux launcher
+    // an AppImage runs from a mount that goes when it exits: the new launcher starts from the AppImage file itself
+    const char *appimage = SDL_getenv("APPIMAGE");
+    char self[4096];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (!appimage && n <= 0)
+        return false;
+    if (n > 0)
+        self[n] = 0;
+    std::string exe = appimage ? appimage : self;
+    single_instance_release();
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        execl(exe.c_str(), exe.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    return pid > 0;
+#endif
+}
+
+bool appimage_update(const std::string &downloaded, const std::string &root, std::string &err) {
+#ifdef _WIN32
+    (void)downloaded, (void)root;
+    err = "not on Windows";
+    return false;
+#else
+    // The game folder's UltraTears.AppImage is what Steam starts (--play) and what the launcher is: the new one takes its
+    // place (a rename on the same disk: update/ is inside the folder; a running old one keeps its own file until it
+    // exits) and is started, without arguments. Newer than the folder's package, it copies its builder into the folder
+    // (tools/install_to.py) and offers to update the game, rebuilding what changed.
+    std::string dst = path_join(root, "UltraTears.AppImage");
+    if (chmod(downloaded.c_str(), 0755) != 0 || rename(downloaded.c_str(), dst.c_str()) != 0) {
+        err = "UltraTears.AppImage: " + std::string(strerror(errno));
+        SDL_Log("update: %s -> %s failed: %s", downloaded.c_str(), dst.c_str(), strerror(errno));
+        return false;
+    }
+    SDL_Log("update: %s is the new UltraTears.AppImage, starting it", downloaded.c_str());
+    single_instance_release();
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        if (chdir(root.c_str()) == 0)
+            execl(dst.c_str(), dst.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    if (pid < 0) {
+        err = "fork: " + std::string(strerror(errno));
+        return false;
+    }
+    return true;
+#endif
+}
+
+std::string game_exe(const std::string &folder) {
+#ifdef _WIN32
+    std::string exe = path_join(folder, "UltraTears.exe");
+    return path_is_file(exe) ? exe : "";
+#else
+    // a build on Linux links it into linux/ (tools/build_game.py); the Steam Deck's tar has it beside its data, and a
+    // folder from the tar rebuilt on the Deck has both: the one built there is the current one
+    for (const char *name : {"linux/ultratears", "ultratears"}) {
+        std::string exe = path_join(folder, name);
+        if (path_is_file(exe))
+            return exe;
+    }
+    return "";
+#endif
+}
+
+bool exec_game(const std::string &folder) {
+#ifdef _WIN32
+    (void)folder;
+    return false;
+#else
+    std::string exe = game_exe(folder);
+    if (exe.empty())
+        return false;
+    std::string dir = exe.substr(0, exe.find_last_of('/'));
+    SDL_Log("play: %s in place of the launcher", exe.c_str());
+    single_instance_release();   // the lock is close-on-exec anyway
+    if (chdir(dir.c_str()) == 0)
+        execl(exe.c_str(), exe.c_str(), (char *)nullptr);
+    SDL_Log("play: exec failed (%s)", strerror(errno));
+    return false;
 #endif
 }
 
 bool start_game(const std::string &folder) {
-    std::string exe = path_join(folder, "UltraTears.exe");
+    std::string exe = game_exe(folder);
+    SDL_Log("play: %s", exe.empty() ? "no game in the folder" : exe.c_str());
+    if (exe.empty())
+        return false;
 #ifdef _WIN32
     std::wstring cmd = L"\"" + wide(exe) + L"\"";
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, wide(folder).c_str(), &si, &pi))
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, DETACHED_PROCESS, nullptr, wide(folder).c_str(), &si, &pi)) {
+        SDL_Log("play: CreateProcess failed (%lu)", GetLastError());
         return false;
+    }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return true;
 #else
+    std::string dir = exe.substr(0, exe.find_last_of('/'));   // the game reads its folder itself (/proc/self/exe)
     pid_t pid = fork();
     if (pid == 0) {
-        if (chdir(folder.c_str()) == 0)
+        setsid();   // not a child of the launcher's session: closing the launcher leaves the game running
+        if (chdir(dir.c_str()) == 0)
             execl(exe.c_str(), exe.c_str(), (char *)nullptr);
         _exit(127);
     }

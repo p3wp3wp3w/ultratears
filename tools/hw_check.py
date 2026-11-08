@@ -13,6 +13,7 @@ goes on; 'info': a remark. The launcher has the texts for the codes in its langu
   vram_low          gpu, gb       warn   less than 4 GB of video memory
   ram_low           gb            warn   less than 16 GB of RAM
   cpu_no_avx2                     warn   the code is built for SSE4.2 (slower)
+  kernel_old        version       warn   Linux below 6.7: no write watch for the game's memory (very slow)
   disk_space        need_gb, free_gb, drive   block
   amd_untested      gpu           info   [temporary] AMD cards are not tested yet (dev-local/docs/issues.md, "#2, #16,
                                          #23"): remove once players with RDNA report that the game runs
@@ -29,9 +30,19 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gpu_check  # noqa: E402
 
 INSTALL_GB = 36            # a build from nothing at its peak (data 27 GB, objects 2.7, tools 0.8, the shader export)
+LINUX_GB = 36              # a build for Linux / Steam Deck on top: the tar 28.7, its objects 2.7, the game 1.4, shaders 1.7, the Linux builder 0.6
 VRAM_GB, RAM_GB = 4, 16
+DECK_TAR = 'UltraTears-SteamDeck.tar'
 AMD = 0x1002
 RANK = {'discrete': 0, 'integrated': 1, 'virtual': 2, 'other': 3, 'CPU': 9}
+
+
+def game_gpu_vendor():
+    """The PCI vendor id of the card the game takes (as gpu_cases picks it), or None."""
+    details = []
+    found = gpu_check.gpus(details=details)
+    ok = [(f, d) for f, d in zip(found or [], details) if f[1] != 'CPU' and not f[3]]
+    return min(ok, key=lambda c: RANK.get(c[0][1], 5))[1]['vendor'] if ok else None
 
 
 def gpu_cases():
@@ -70,7 +81,7 @@ class MemoryStatus(ctypes.Structure):
 
 
 def ram_bytes():
-    if sys.platform != 'win32':
+    if os.name != 'nt':   # Linux: the physical pages (as PR #42 has it)
         try:
             return os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
         except (ValueError, OSError):
@@ -80,7 +91,7 @@ def ram_bytes():
 
 
 def avx2():
-    if sys.platform != 'win32':   # Linux: the CPU's flags as the kernel reports them
+    if os.name != 'nt':   # Linux: the CPU's flags as the kernel reports them
         try:
             return any(line.startswith('flags') and ' avx2' in line for line in open('/proc/cpuinfo'))
         except OSError:
@@ -99,11 +110,13 @@ def folder_size(p):
     return total
 
 
-def disk_case(folder):
+def disk_case(folder, linux=False):
     """Enough free space where the build goes? What is already built there (an update) counts as taken."""
     folder = pathlib.Path(folder)
-    have = sum(folder_size(folder / d) for d in ('data', 'build', 'deps') if (folder / d).is_dir())
-    need = max(0, INSTALL_GB * 2**30 - have)
+    have = sum(folder_size(folder / d) for d in ('data', 'build', 'deps', 'build-linux', 'linux') if (folder / d).is_dir())
+    if (folder / DECK_TAR).is_file():
+        have += (folder / DECK_TAR).stat().st_size
+    need = max(0, (INSTALL_GB + (LINUX_GB if linux else 0)) * 2**30 - have)
     probe = folder
     while not probe.exists() and probe.parent != probe:
         probe = probe.parent
@@ -114,14 +127,34 @@ def disk_case(folder):
              'args': {'need_gb': round(need / 2**30), 'free_gb': round(free / 2**30), 'drive': str(probe.resolve().drive or probe)}}]
 
 
-def cases(folder):
-    out = gpu_cases()
-    ram = ram_bytes()
-    if ram and ram < RAM_GB * 2**30 * 0.9:   # a 16 GB PC reports a little less (memory the firmware keeps)
-        out.append({'code': 'ram_low', 'sev': 'warn', 'args': {'gb': round(ram / 2**30)}})
-    if not avx2():
-        out.append({'code': 'cpu_no_avx2', 'sev': 'warn', 'args': {}})
-    return out + disk_case(folder)
+def cases(folder, platforms=('windows',)):
+    """platforms: what is built. A build for the Steam Deck alone asks nothing of this PC's graphics card, memory or CPU
+    (the game runs on the Deck), only the disk space."""
+    out = []
+    if 'windows' in platforms:
+        out = gpu_cases()
+        ram = ram_bytes()
+        if ram and ram < RAM_GB * 2**30 * 0.9:   # a 16 GB PC reports a little less (memory the firmware keeps)
+            out.append({'code': 'ram_low', 'sev': 'warn', 'args': {'gb': round(ram / 2**30)}})
+        if not avx2():
+            out.append({'code': 'cpu_no_avx2', 'sev': 'warn', 'args': {}})
+    if os.name != 'nt' and kernel_version() < KERNEL_WRITE_WATCH:   # the game is built where it runs
+        out.append({'code': 'kernel_old', 'sev': 'warn', 'args': {'version': os.uname().release}})
+    return out + disk_case(folder, 'linux' in platforms)
+
+
+KERNEL_WRITE_WATCH = (6, 7)   # userfaultfd write protection without faults (WP_ASYNC) and PAGEMAP_SCAN
+
+
+def kernel_version():
+    """Linux's version as numbers ((0, 0): unknown, as when not Linux). Below 6.7 the game has no write watch
+    (src/runtime/platform/linux.c): every pool the GPU uses is copied whole before each submission, very slow (as
+    totk-pc-recomp warns, installer/steps.py). SteamOS 3.8 and later have 6.11+."""
+    try:
+        parts = os.uname().release.split('-')[0].split('.')
+        return tuple(int(p) for p in parts[:2])
+    except (AttributeError, ValueError):
+        return (0, 0)
 
 
 def text(case):
@@ -137,6 +170,7 @@ def text(case):
         'vram_low': f'{a.get("gpu")} has {a.get("gb")} GB of video memory; 4 GB or more is recommended',
         'ram_low': f'this PC has {a.get("gb")} GB of RAM; 16 GB or more is recommended',
         'cpu_no_avx2': 'the CPU lacks AVX2: the game is built for SSE4.2 and runs a little slower',
+        'kernel_old': f'Linux {a.get("version")}: 6.7 or newer is needed, else the game cannot track its memory writes and runs very slowly; update the system',
         'disk_space': f'the build needs {a.get("need_gb")} GB on {a.get("drive")}, {a.get("free_gb")} GB is free',
         'amd_untested': f'{a.get("gpu")}: AMD cards are not tested yet; please report how the game runs',
     }.get(case['code'], case['code'])

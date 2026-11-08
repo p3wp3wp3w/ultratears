@@ -50,6 +50,52 @@ def get_s(reg):
     return f'({{ uint32_t u_ = (uint32_t)c->v[{reg}]; float f_; __builtin_memcpy(&f_, &u_, 4); f_; }})'
 
 
+# ---- Scene (render) resolution. Where and what from MacNativeGames games/totk/runtime/game_patches_v143.c
+# (patch_render_res, MIT, Copyright (c) 2026 MacNativeGames contributors): every path that picks the scene size goes
+# through main+0x585e48, which converts the graphics-parameter entry's size (docked 1600x900) to floats and stores them
+# as the renderer's width (+0xcc4) and height (+0xcc8); the game derives its scene targets (and their half and quarter
+# sizes) from these, and its own FSR 1 (EASU) draws the scene onto its canvas. Here the two stores take the size
+# src/host/render_res.c chose instead, when there is one. The output (canvas, UI, swapchain): the swapchain size nnMain
+# writes (main+0xbdb584) and, as the display configuration publishes its active output (main+0x3dcb28), its canvas
+# (+0x10) and that output (+0x508, the original store that follows). Also from MacNativeGames (patch_output_res), as
+# totk-pc-recomp's patches-v143.txt carries them.
+def scene_size(axis):   # str s0, [x19, #0xcc4 / #0xcc8]
+    orig = {0: 0xbd0cc660, 1: 0xbd0cca60}[axis]
+
+    def f(gen, addr):
+        expect(gen, addr, orig, 'scene_size')
+        return ('{ extern int totk_scene_size(float *w, float *h); float w_, h_; '
+                f'if (totk_scene_size(&w_, &h_)) {set_s(0, "w_" if axis == 0 else "h_")} }} {gen.c_of(orig, addr)}')
+    return f
+
+
+def output_size(gen, addr):   # movk x8, #0x438, lsl #32: the swapchain size the game asks for (1920x1080)
+    expect(gen, addr, 0xf2c08708, 'output_size')
+    return ('{ extern int totk_output_size(uint64_t *packed); uint64_t s_; '
+            f'if (totk_output_size(&s_)) c->x[8] = s_; else {{ {gen.c_of(0xf2c08708, addr)} }} }}')
+
+
+def aspect(orig):
+    """The camera's aspect ratio for an output of another shape than 16:9 (src/host/render_res.c totk_aspect): sites that
+    leave the ratio sead's perspective projection takes in s0. Two camera sites (update: ldr s0, [x19, #0x140]; setup:
+    ldr s0, [x22, #0x68]) load the camera's copy of DefaultAspect 1.777778, two viewport routines divide width by height
+    (fdiv s0, s0, s1). After the original instruction s0 takes the output's ratio, so a 21:9 output shows more of the
+    world at the sides with the vertical view kept (Hor+), and 16:10 more above and below. Sites from totk-pc-recomp's
+    recomp/patches-v143.txt (set aspect; MIT, Copyright (c) 2026 Valiantsin Dzerakh), from MacNativeGames'
+    game_patches_v143.c / aspect_patch.h (MIT, Copyright (c) 2026 MacNativeGames contributors)."""
+    def f(gen, addr):
+        expect(gen, addr, orig, 'aspect')
+        return (f'{gen.c_of(orig, addr)} {{ extern int totk_aspect(float *r); float r_; '
+                f'if (totk_aspect(&r_)) {set_s(0, "r_")} }}')
+    return f
+
+
+def output_canvas(gen, addr):   # before lsr x4, x3, #32: the display configuration's canvas (+0x10) and active output (+0x508)
+    expect(gen, addr, 0xd360fc64, 'output_canvas')
+    return ('{ extern int totk_output_size(uint64_t *packed); uint64_t s_; '
+            'if (totk_output_size(&s_)) { c->x[3] = s_; ST64(c->x[19] + 0x10, s_); } }')
+
+
 # fps60: the adaptive present-interval controller (main+0x2db174) gets the minimum interval 1 (60 Hz ticks) instead of
 # the shipping data's 2. The controller still raises the interval when a frame does not fit.
 FPS60 = [(0x2db204, 0x6b08015f, 0x7100055f),   # clamp: cmp w10, #1 (was cmp w10, w8 = minimum)
@@ -133,8 +179,69 @@ def fade(reg):
     return f
 
 
+# shadow_size: the sun shadow map at one size (src/host/render_res.c totk_shadow_size). Site from totk-pc-recomp 1a07a8d
+# (recomp/patches-v143.txt, MIT): 1.4.3 interpolates the size between a minimum and the base and rounds it up to 8 at
+# main+0x683604 (add w11, w11, #7); the rounded value is the width (+0x3d8) and, through the packed store at +0xf4, the
+# height (+0x3f8). The fixed size goes into w11 just before the rounding.
+def shadow_size(gen, addr):
+    expect(gen, addr, 0x11001d6b, 'shadow_size')   # add w11, w11, #7
+    return '{ extern int totk_shadow_size(uint32_t *n); uint32_t n_; if (totk_shadow_size(&n_)) c->x[11] = n_; }'
+
+
+# Equipment-switch cooldown (from totk-pc-recomp recomp/patches-v143.txt, MIT; their issue #18, found by JieML1100):
+# the player update (main+0x2b0368) steps the countdown at player state +0x109c only while it is above FLT_EPSILON, but
+# the equipment gate (main+0x31cc7c) blocks weapon, shield and bow changes while it is above 0. Whole 30 Hz steps reach
+# exactly 0; a measured step leaves a rounding remainder, and one in (0, FLT_EPSILON] is never stepped again and keeps
+# equipment locked until a load. With realtime the threshold is 0: the remainder goes below 0 like any last step.
+def cooldown(gen, addr):   # movi v1.2s, #0x34, lsl #24 (FLT_EPSILON) -> movi v1.2s, #0
+    return word_or(gen, addr, 0x0f016681, 0x0f000401, fr('totk_fr_realtime'), 'equipment cooldown')
+
+
+# The game's zstd decoder through the host's libzstd (src/host/zstd_host.c; sites from totk-pc-recomp
+# recomp/patches-v143.txt, MIT): each call of ZSTD_decompressMultiFrame (main+0x3a1f0) and ZSTD_decompress_usingDDict
+# (main+0x3a1e0) below goes to a host function, which hands what it does not take to the same guest function. Not
+# main+0x547a04: that caller (main+0x547964) resets a static DCtx of its own with which the game's zstd rejects some
+# valid frames, and the game relies on that result. TOTK_ZSTD_NATIVE=0: the guest decoder.
+def zstd_call(word, target, host):
+    def f(gen, addr):
+        expect(gen, addr, word, 'zstd call')
+        return (f'{{ extern int totk_zstd_native(void); extern void {host}(Cpu *c); extern void f_{target:x}(Cpu *c); '
+                f'c->x[30] = {addr + 4:#x}ull; if (totk_zstd_native()) {host}(c); else f_{target:x}(c); }}')
+    return f
+
+
+# Spin waits (tools/lifter/spin_waits_v143.txt): {back-edge: loop head}, absolute. gen.py puts rt_spin_gate on the
+# back-edge; the bases are tools/gen_game.py MODULES.
+def _spins():
+    import os
+    bases = {'main': 0x800000000, 'subsdk0': 0x804000000, 'sdk': 0x805000000}
+    out = {}
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'spin_waits_v143.txt')) as f:
+        for line in f:
+            w = line.split('#')[0].split()
+            if len(w) == 4 and w[0] == 'spin':
+                b = bases[w[1]]
+                out[b + int(w[3], 16)] = b + int(w[2], 16)
+    return out
+
+
+SPINS = _spins()
+ZSTD_MULTI, ZSTD_DDICT = MAIN + 0x3a1f0, MAIN + 0x3a1e0
+ZSTD_SITES = {0x5f5358: (0x97e913a6, ZSTD_MULTI), 0x6d7788: (0x97e58a9a, ZSTD_MULTI), 0xbdc8e8: (0x97d17642, ZSTD_MULTI),
+              0x27ce4dc: (0x9761af45, ZSTD_MULTI), 0x5f574c: (0x97e912a5, ZSTD_DDICT), 0xbdc910: (0x97d17634, ZSTD_DDICT),
+              0x1852314: (0x979f9fb3, ZSTD_DDICT)}
+
+
 PATCHES = {
+    MAIN + 0x2b036c: cooldown,
+    **{MAIN + a: zstd_call(w, t, 'totk_zstd_multiframe' if t == ZSTD_MULTI else 'totk_zstd_using_ddict')
+       for a, (w, t) in ZSTD_SITES.items()},
     0x8005843e0: drs_off,
+    MAIN + 0x585e50: scene_size(0),
+    MAIN + 0x585e60: scene_size(1),
+    MAIN + 0xbdb584: output_size,
+    MAIN + 0x628c74: aspect(0xbd414260), MAIN + 0xb43460: aspect(0xbd406ac0),
+    MAIN + 0x1ff04f4: aspect(0x1e211800), MAIN + 0x253fbb0: aspect(0x1e211800),
     **{MAIN + a: fps60(o, r) for a, o, r in FPS60},
     MAIN + 0x2daa54: rt_ratio_load,
     MAIN + 0x2daa6c: rt_ratio_skip(0x5e21d800),   # scvtf s0, s0
@@ -148,4 +255,6 @@ PRE_PATCHES = {
     MAIN + 0x3e5658: rt_step_ticks,
     MAIN + 0x24944c: cloth_call, MAIN + 0x28bc98: cloth_call,
     MAIN + 0x562a68: bounce,
+    MAIN + 0x3dcb28: output_canvas,
+    MAIN + 0x683604: shadow_size,
 }

@@ -327,13 +327,20 @@ NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool
 // TOTK: logging switches checked on per-call paths (command memory, recording, submits) are read once.
 static int cmdlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CMD_LOG") != NULL; return on; }
 static int poollog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_POOL_LOG") != NULL; return on; }
+static int chainlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CHAIN_LOG") != NULL; return on; }   // read once: EndRecording and Submit run hundreds of times a frame
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
     if ((o->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) && !totk_vpool_init(o)) { o->magic = 0; return 0; }
     int gpu_visible = !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS);
-    if (o->mem && gpu_visible) { x_pool_reuse(o->mem, o->size); mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); }
+    // A virtual pool's storage is a reserved, inaccessible range (totk_vpool_win.c): nothing to import or copy (an import
+    // of it fails; a copy would fault reading it); the GPU reaches its pages through the physical pools.
+    if (o->mem && gpu_visible) {
+        x_pool_reuse(o->mem, o->size);
+        if (!(o->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) mtl_pool_add(o->mem, o->size);
+        nvn_dirty_add_range(o->mem, o->size);
+    }
     o->va = o->mem && gpu_visible ? va_assign((uint64_t)(uintptr_t)o->mem, o->size) : (uint64_t)(uintptr_t)o->mem;
     if (!o->mem) LOG("[error] MemoryPoolInitialize has no storage, flags=%#x size=%#llx", o->flags, o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
@@ -923,11 +930,13 @@ static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; } copy_prefix;
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
-static uint8_t *flatten_recording(const uint8_t *p) {
-    size_t n = sizeof(copy_prefix), cap = 4096; uint8_t *out = malloc(cap);
-    int bulk_ok = 1; uint32_t last_size = 0;
-    if (!out) die("command copy allocation");
-    for (;;) {
+// Two passes (as totk-pc-recomp's flatten_recording): the first walks the ops and measures, the second copies each run
+// between jumps with one memcpy into one allocation of the exact size. Copying op by op into a buffer that doubled
+// and was trimmed at the end cost the game thread a realloc chain per recording.
+static uint8_t *flatten_recording(const uint8_t *start) {
+    size_t n = sizeof(copy_prefix);
+    int bulk_ok = 1; uint32_t last_size = 0, end_size = 0;
+    for (const uint8_t *p = start;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
@@ -935,18 +944,28 @@ static uint8_t *flatten_recording(const uint8_t *p) {
         if (n == sizeof(copy_prefix)) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
         else if (h.op == OP_BEGIN) bulk_ok = 0;
         else if (h.op != OP_END) last_size = h.size;
-        if (n + h.size > cap) { while (n + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-        memcpy(out + n, p, h.size); n += h.size;
-        if (h.op == OP_END) {
-            uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed;
-            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
-            size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
-            c->body_bytes = bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
-            c->last_size = c->body_bytes ? last_size : 0;
-            g_copy_bytes += malloc_size(out); return out + sizeof(copy_prefix);
-        }
+        n += h.size;
+        if (h.op == OP_END) { end_size = h.size; break; }
         p += h.size;
     }
+    uint8_t *out = malloc(n);
+    if (!out) die("command copy allocation");
+    size_t at = sizeof(copy_prefix);
+    for (const uint8_t *p = start, *run = start;;) {   // run: the start of the ops not yet copied
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.op == OP_JUMP) {
+            memcpy(out + at, run, (size_t)(p - run)); at += (size_t)(p - run);
+            memcpy(&p, p + 8, 8); run = p; continue;
+        }
+        p += h.size;
+        if (h.op == OP_END) { memcpy(out + at, run, (size_t)(p - run)); at += (size_t)(p - run); break; }
+    }
+    if (at != n) die("command copy: %zu bytes copied of %zu measured", at, n);
+    copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
+    size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
+    c->body_bytes = bulk_ok && end_size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
+    c->last_size = c->body_bytes ? last_size : 0;
+    g_copy_bytes += malloc_size(out); return out + sizeof(copy_prefix);
 }
 /* Track handle use for diagnostics; lifetime depends on control-memory reuse, never elapsed frames. */
 static void copy_touch(NVNcommandHandle h, uint64_t now) {
@@ -1055,7 +1074,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
-    if (getenv("TOTK_CHAIN_LOG")) { static int n; if (n++ < 200) guest_chain("EndRecording"); }
+    if (chainlog_env()) { static int n; if (n++ < 200) guest_chain("EndRecording"); }
     return (NVNcommandHandle)copy;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
@@ -2029,7 +2048,7 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 // TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. [Windows port] On by default since 2026-10-24: with
 // the Vulkan replay on the game's thread the Great Sky Island ran at ~95 ms a frame, with this thread at ~58 ms.
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL, XJ_SHREL, XJ_POOLREL, XJ_TEXWRITE };
-typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL) or of the written one (XJ_TEXWRITE); ucap: uniforms captured at the submit call, the shaders a program let go of (XJ_SHREL), the pool's memory (XJ_POOLREL) or the texels (XJ_TEXWRITE, xtexw)
+typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub, slot; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL) or of the written one (XJ_TEXWRITE); ucap: uniforms captured at the submit call, the shaders a program let go of (XJ_SHREL), the pool's memory (XJ_POOLREL) or the texels (XJ_TEXWRITE, xtexw)
 #define XQ 64
 #define XF 4096
 static xjob g_xq[XQ];
@@ -2054,7 +2073,7 @@ static int async_replay(void) {
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
-static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
+static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, uint64_t qslot);
 static void *x_thread(void *unused) {
     (void)unused; pthread_setname_np("totk-translate");
     { void plat_thread_boost(void); plat_thread_boost(); }   // [Windows port] the frame waits for this thread
@@ -2082,7 +2101,7 @@ static void *x_thread(void *unused) {
             // worker threads preempt the replay (measured: replay 6.6 -> 13 ms, 10 fps). Half the period is declared.
             static uint64_t rt; uint64_t per = (uint64_t)(j.period * 1e9);
             if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
-            present_exec(j.win, j.idx, j.period, j.crop, j.frame);
+            present_exec(j.win, j.idx, j.period, j.crop, j.frame, j.slot);
             void vkb_tex_writeback_frame(void); vkb_tex_writeback_frame();   // GPU-drawn contents into game memory (vkb_tex.c)
             void vkb_tex_rtlog_frame(void); vkb_tex_rtlog_frame();           // TOTK_RT_LOG: how full the logged targets are
         }
@@ -2286,7 +2305,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
             LOG("[shape]   calls %u: draws in calls %u (outside %u), largest %u, calls with 100+: %u; per call:%s", ncall, inc, tot - inc, cmx, cbig, line);
         }
       } }
-    if (getenv("TOTK_CHAIN_LOG")) { static int k; if (k++ < 20) guest_chain("Submit"); }
+    if (chainlog_env()) { static int k; if (k++ < 20) guest_chain("Submit"); }
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     /* TOTK diagnostic (TOTK_WATCH_ADDR): submissions in progress, and their start / end times, to line up guest writes with replay */
     atomic_fetch_add(&dm_submit_busy, 1);
@@ -2597,7 +2616,7 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // 缺省（Mac�
 // 长帧日志的逐帧环（GPU 时间滞后 8 帧才有，所以先存后判）
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms, log_ms; unsigned pso, lib, up, rup, log_n; int ls; } lf_rec;   // ls：这一帧出图时读取画面是否盖着 | ls: whether the loading screen was covering the picture when this frame was presented
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[long frame] %s", what); }   // 缺省（图形单测）；宿主 diag.c 的强定义补上场景上下文并写 perf.txt | Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
 extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
@@ -2624,8 +2643,9 @@ static void tsummary(uint64_t frame) {
     }
     LOG("[nvn] timing through frame %llu:%s", frame, line);
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // 帧间隔另起一行（M1 基线）：本窗口 > 16.7 ms 帧数与 p99 | frame interval gets its own line (M1 baseline): number of frames > 16.7 ms in this window and p99
-      if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > 16.7;
-        LOG("[nvn] frame intervals through frame %llu: >16.7 ms for %u / %u frames, p99 %.2f ms", frame, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
+      unsigned hitch = 0;   // UltraTears: frames over 25 ms, the hitches a player sees at 60 fps
+      if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) { over += v[i] > 16.7; hitch += v[i] > 25.0; }
+        LOG("[nvn] frame intervals through frame %llu: >16.7 ms for %u / %u frames, >25 ms for %u, p99 %.2f ms", frame, over, n, hitch, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
     { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // 上屏：掉帧 = 间隔 > 16.7 × 1.5 ms 或被丢弃 | on-screen present: dropped frame = interval > 16.7 × 1.5 ms or discarded
       for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > 25.0; } }
       task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT; double fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
@@ -2809,12 +2829,13 @@ static void present_cfg(const win_t *o) {
        real-time step patches (tools/lifter/patches.py): our own clock paces at the limit (0: no pacing, unlimited),
        one frame per period whatever interval the game chose (the step follows the frames as they take), and the
        window shows the newest frame. 30 keeps the shipping pacing by the game's interval. */
-    { extern int totk_fr_limit(void); extern float window_refresh_hz(void);
+    { extern int totk_fr_limit(void), totk_fr_limit_max(void); extern float window_refresh_hz(void);
       int lim = totk_fr_limit();
       g_uncapped = !e && realtime && lim != 30;
       if (g_uncapped) {
           float mon = window_refresh_hz();
           g_hz = lim > 0 ? lim : lim < 0 ? (mon >= 30 ? (int)(mon + 0.5f) : 60) : 0;
+          if (g_hz > totk_fr_limit_max()) g_hz = totk_fr_limit_max();   // a 280 Hz monitor: the game's shortest step
           atomic_store(&g_uncapped_interval, 1);
           LOG("[nvn] frame limit: own clock at %d fps%s (monitor %.2f Hz)", g_hz, g_hz ? "" : " = unlimited", mon);
       } }
@@ -2854,6 +2875,12 @@ static uint64_t present_period(const win_t *o) {
                                     m == MFX_MAX ? (g_uncapped ? "maximum interpolation: uncapped, one interpolated frame per game frame" : "maximum interpolation: game interval, one interpolated frame per game frame") :
                                     g_uncapped ? "interpolation off: uncapped" : "interpolation off: game interval"); was = m; }
     if (m == MFX_30) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
+    {   /* TOTK_FPS_UNCAP_AT=<frame> (development): unlimited from that frame on. Input scripts count frames from the
+           title at the limit; the measurement windows after it show what the frame takes. */
+        static long long at = -2;
+        if (at == -2) { const char *u = getenv("TOTK_FPS_UNCAP_AT"); at = u && *u ? atoll(u) : -1; }
+        if (at >= 0 && g_frame >= (uint64_t)at) return 0;
+    }
     return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
 }
 /* Exercise production policy, including the shrine's interval=2 and the
@@ -2911,7 +2938,7 @@ void dm_nvn_probe_present_interval(void) {
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 // The present itself: screenshot hook, then the present queue (returns at once). frame != 0 (translation thread): also the
 // replay frame number, which the synchronous path sets at the end of nvnQueuePresentTexture.
-static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame) {
+static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame, uint64_t qslot) {
     gfx_enter();
     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop);   // 只入队，立即返回 | enqueue only, return immediately
@@ -2922,7 +2949,21 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
-    if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
+    /* UltraTears: with the frame limit (uncapped, host/frame_rate.c), as totk-pc-recomp's nvnQueuePresentTexture (MIT,
+       nvn_api_obj.c, after MacNativeGames' nvn_pace.h): the display slot is paced here, at the game's present: the
+       previous slot plus one period of the limit (early: wait for it; late by less than a period: at once, keeping the
+       phase; later: from now). The present thread holds the host present until the slot (mtl_present_slot), the image is
+       free for the game one period later, and the real-time step follows the slots. */
+    present_cfg(o);
+    uint64_t qslot = 0;
+    if (g_uncapped && uncapped_now() && !dm_detclock_enabled()) {
+        uint64_t period = present_period(o), now = now_ns();
+        nvn_pacer pc = {o->pace};
+        qslot = now + nvn_pace(&pc, now, period);
+        o->pace = pc.target;
+        if (idx >= 0 && idx < 4) o->avail[idx] = period ? qslot + period : 0;
+    }
+    if (runtime_frame_step_update) runtime_frame_step_update(qslot ? qslot : now_ns());
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
@@ -2944,12 +2985,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     present_cfg(o);
     uint64_t t0 = now_ns();
     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
-        xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9};
+        xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9, .slot = qslot};
         memcpy(j.crop, o->crop, sizeof j.crop);
         j.frame = g_frame + 1;   // dump_frame below advances g_frame before mtl_set_frame
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
-    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0);
+    } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0, qslot);
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     trow(f, "@present_guest_ticks", o->interval);
@@ -3010,6 +3051,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->ls = g_nvn_loadscreen_up ? g_nvn_loadscreen_up() : 0; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
             plns = lns; ppns = pns; pup = up; prup = rup; pub = ub;
+            void runtime_log_cost(uint64_t *writes, uint64_t *ns);   // runtime/logcost.c: the log's writes and their time
+            static uint64_t plw, plt; uint64_t lw, lt; runtime_log_cost(&lw, &lt);
+            r->log_n = (unsigned)(lw - plw); r->log_ms = (lt - plt) / 1e6; plw = lw; plt = lt;
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
@@ -3030,6 +3074,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
               // 可见性：长帧「晚出来」的那段时间屏幕上停着的是上一帧；上一帧若是读取画面（或本帧自己就是），玩家看到的只是读取画面多停了一下，没有运动被打断
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               const lf_rec *pv = &g_lf[(f - 9) % LFN]; int hidden = r->ls || (f >= 9 && pv->f == f - 9 && pv->ls);
+              if (r->log_ms >= 0.1) {   // the log's own writes this frame (unbuffered: each one a write to the file)
+                  char lb[64]; snprintf(lb, sizeof lb, "; log %u writes / %.1f ms", r->log_n, r->log_ms); strlcat(b, lb, sizeof b); }
               if (hidden) strlcat(b, "; next to a loading screen, not visible", sizeof b);
               dm_longframe_note(b); } }
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
@@ -3055,10 +3101,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // 真机语义：出图只入队、立即返回；本帧显示时刻按节拍器排，该贴图到「显示时刻 + 一个周期」才可再获取（阻塞在 AcquireTexture）
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
-    nvn_pacer pc = {o->pace};
-    uint64_t slot = now + nvn_pace(&pc, now, period);
-    o->pace = pc.target;
-    if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
+    uint64_t slot;
+    if (qslot) slot = qslot;   // UltraTears: paced at the game's present (nvnQueuePresentTexture), held to it by the present thread
+    else {
+        nvn_pacer pc = {o->pace};
+        slot = now + nvn_pace(&pc, now, period);
+        o->pace = pc.target;
+        if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
+    }
+    mtl_present_slot(qslot);
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // 屏幕上相邻两帧的显示间隔（掉帧看这个） | display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
     // 实际呈现间隔（窗口模式）：滞后 8 次出图取（呈现回调已到），第 n 次与第 n−1 次之差；−1 = 被丢弃
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded

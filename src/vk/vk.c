@@ -1,5 +1,6 @@
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 // The shared Vulkan instance and device (see vk.h).
 #include "vk.h"
@@ -22,9 +23,12 @@ static pthread_mutex_t queue_mu = PTHREAD_MUTEX_INITIALIZER;
 void vk_queue_lock(void) { pthread_mutex_lock(&queue_mu); }
 void vk_queue_unlock(void) { pthread_mutex_unlock(&queue_mu); }
 
+void vk_device_fault_report(void);
 int vk_check(VkResult r, const char *what) {
     if (r == VK_SUCCESS) return 1;
     LOG("%s failed (%d)", what, (int)r);
+    static int reported;
+    if (r == VK_ERROR_DEVICE_LOST && !reported++) vk_device_fault_report();   // once, whichever call saw it first
     return 0;
 }
 
@@ -53,7 +57,24 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL validation_message(VkDebugUtilsMessageSeve
     return VK_FALSE;
 }
 
+// Mesa's drivers (RADV on the Steam Deck) keep a shader cache of their own beside ours, by default in ~/.cache and up to
+// 1 GB. A Deck's /home is small and the game usually sits on the SD card: unless MESA_SHADER_CACHE_DIR names a folder,
+// it goes to mesa-cache in the game folder. Read by the driver when the device is made, so set before the instance.
+// (As totk-pc-recomp's vk_device.c mesa_cache_beside_exe, MIT.)
+static void mesa_cache_beside_game(void) {
+#ifndef _WIN32
+    if (getenv("MESA_SHADER_CACHE_DIR")) return;
+    char dir[4096];
+    ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 16);
+    char *cut = n > 0 ? (dir[n] = 0, strrchr(dir, '/')) : NULL;
+    if (!cut) return;
+    strcpy(cut + 1, "mesa-cache");
+    setenv("MESA_SHADER_CACHE_DIR", dir, 0);
+#endif
+}
+
 static int create_instance(SDL_Window *window) {
+    mesa_cache_beside_game();
     PFN_vkGetInstanceProcAddr gipa = NULL;
     if (window) gipa = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
     else {   // no window (TOTK_HEADLESS): SDL's video subsystem is not up, so the loader is loaded here
@@ -195,6 +216,8 @@ static VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_T
 static VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
 static VkPhysicalDeviceDepthClipEnableFeaturesEXT fdce = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
 static VkPhysicalDeviceCustomBorderColorFeaturesEXT fcbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+static VkPhysicalDeviceFaultFeaturesEXT ffault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+static VkPhysicalDeviceRobustness2FeaturesEXT frb2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
 static VkPhysicalDeviceProvokingVertexFeaturesEXT fpv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
 static VkPhysicalDeviceConditionalRenderingFeaturesEXT fcr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
 static VkPhysicalDeviceIndexTypeUint8FeaturesEXT fu8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
@@ -244,9 +267,15 @@ static int create_device(void) {
         {VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, NULL, &vkc.has_checkpoints},
         // ...and written by the GPU to host memory, which outlives the device (the NVIDIA driver gave 0 checkpoints, 2026-10-27)
         {VK_AMD_BUFFER_MARKER_EXTENSION_NAME, NULL, &vkc.has_buffer_marker},
+        // the driver's own report of a lost device: what failed and where (AMD, Mesa; as totk-pc-recomp 112fb2d)
+        {VK_EXT_DEVICE_FAULT_EXTENSION_NAME, &ffault, &vkc.has_device_fault},
+        // development (TOTK_VK_ROBUST=2): out-of-range buffer reads give 0, as AMD's buffer descriptors always do
+        {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, &frb2, NULL},
     };
+    const char *robust = getenv("TOTK_VK_ROBUST");
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) {
         if (!strcmp(want[i].name, VK_KHR_SWAPCHAIN_EXTENSION_NAME) && !vkc.surface) continue;
+        if (want[i].features == &frb2 && !(robust && !strcmp(robust, "2"))) continue;
         if ((want[i].flag == &vkc.has_checkpoints || want[i].flag == &vkc.has_buffer_marker) && !getenv("TOTK_VK_CHECKPOINTS")) continue;
         if (!ext_in(&ex, want[i].name)) { LOG("extension %s not available", want[i].name); continue; }
         names[nnames++] = want[i].name;
@@ -288,6 +317,8 @@ static int create_device(void) {
     // NVN samplers take any border colour (TOTK clamps the grass interaction map to 0.5 grey); the samplers are made
     // before the texture is known, so the colour must work without a format
     vkc.has_custom_border = has_cbc && fcbc.customBorderColors && fcbc.customBorderColorWithoutFormat;
+    vkc.has_device_fault = vkc.has_device_fault && ffault.deviceFault;
+    ffault.deviceFaultVendorBinary = VK_FALSE;   // the counts and addresses are enough for the log
     if (vkc.has_custom_border) {
         VkPhysicalDeviceCustomBorderColorPropertiesEXT cbp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &cbp};
@@ -298,9 +329,16 @@ static int create_device(void) {
     fcbc.customBorderColors = (VkBool32)vkc.has_custom_border;   // the features enabled are the ones used
     fcbc.customBorderColorWithoutFormat = (VkBool32)vkc.has_custom_border;
     // TOTK_VK_ROBUST=1 (development): bounds-checked buffer access, to tell a shader's out-of-range access from other
-    // causes of a lost device
-    if (!getenv("TOTK_VK_ROBUST")) f2.features.robustBufferAccess = VK_FALSE;
-    else LOG("robust buffer access %s (TOTK_VK_ROBUST)", f2.features.robustBufferAccess ? "on" : "not supported");
+    // causes of a lost device; =2 with robustBufferAccess2: a read past the bound range gives 0 (vertex fetch: 0 or
+    // (0,0,0,1)), as on AMD, whose buffer descriptors check the range in hardware whatever the device enables
+    frb2.robustImageAccess2 = frb2.nullDescriptor = VK_FALSE;
+    if (!robust) f2.features.robustBufferAccess = VK_FALSE;
+    else LOG("robust buffer access %s%s (TOTK_VK_ROBUST)", f2.features.robustBufferAccess ? "on" : "not supported",
+             frb2.robustBufferAccess2 ? ", reads past the range give 0 (robustBufferAccess2)" : "");
+    if (f2.features.robustBufferAccess && vkc.has_descriptor_buffer) {   // robust buffer descriptors may be larger
+        vkc.db.uniformBufferDescriptorSize = vkc.db.robustUniformBufferDescriptorSize;
+        vkc.db.storageBufferDescriptorSize = vkc.db.robustStorageBufferDescriptorSize;
+    }
     vkc.has_descriptor_buffer = vkc.has_descriptor_buffer && fdb.descriptorBuffer;
     if (vkc.has_descriptor_buffer) fdb.descriptorBufferCaptureReplay = VK_FALSE;   // tools only, costs driver work
     if (vkc.has_descriptor_buffer)
@@ -333,4 +371,29 @@ int vk_init(SDL_Window *window) {
     if (!state) state = create_instance(window) && pick_device() && create_device() ? 1 : -1;
     pthread_mutex_unlock(&mu);
     return state == 1;
+}
+
+/* After VK_ERROR_DEVICE_LOST (VK_EXT_device_fault): the driver's description of the fault, the GPU addresses it involved
+   and the vendor's codes, into the log. Nothing when the driver has no report. */
+void vk_device_fault_report(void) {
+    if (!vkc.has_device_fault || !vk.vkGetDeviceFaultInfoEXT) return;
+    VkDeviceFaultCountsEXT n = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (vk.vkGetDeviceFaultInfoEXT(vkc.device, &n, NULL) != VK_SUCCESS) { LOG("device fault: no report from the driver"); return; }
+    VkDeviceFaultAddressInfoEXT addr[16];
+    VkDeviceFaultVendorInfoEXT ven[16];
+    if (n.addressInfoCount > 16) n.addressInfoCount = 16;
+    if (n.vendorInfoCount > 16) n.vendorInfoCount = 16;
+    n.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = addr, .pVendorInfos = ven};
+    VkResult r = vk.vkGetDeviceFaultInfoEXT(vkc.device, &n, &info);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) { LOG("device fault: no report from the driver (%d)", (int)r); return; }
+    LOG("device fault: %s", info.description[0] ? info.description : "(no description)");
+    static const char *const kind[] = {"none", "invalid read", "invalid write", "invalid execute", "instruction pointer unknown",
+                                       "instruction pointer invalid", "instruction pointer fault"};
+    for (uint32_t i = 0; i < n.addressInfoCount; i++)
+        LOG("  address %#llx (+-%#llx): %s", (unsigned long long)addr[i].reportedAddress,
+            (unsigned long long)addr[i].addressPrecision, addr[i].addressType < 7 ? kind[addr[i].addressType] : "?");
+    for (uint32_t i = 0; i < n.vendorInfoCount; i++)
+        LOG("  vendor: %s (code %#llx, data %#llx)", ven[i].description, (unsigned long long)ven[i].vendorFaultCode,
+            (unsigned long long)ven[i].vendorFaultData);
 }

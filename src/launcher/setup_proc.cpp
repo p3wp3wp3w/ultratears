@@ -114,6 +114,10 @@ std::string python_path(const std::string &root) {
 SetupProc *setup_start(const std::vector<std::string> &args, const std::string &cwd, const std::string &log_path) {
     SetupProc *p = new SetupProc;
     p->lock = SDL_CreateMutex();
+    std::string line;
+    for (const std::string &a : args)
+        line += (line.empty() ? "" : " ") + a;
+    SDL_Log("builder: %s (in %s, its log %s)", line.c_str(), cwd.c_str(), log_path.c_str());
     if (!log_path.empty()) {
         std::string prev = log_path.substr(0, log_path.size() - 4) + "-previous.log";
         SDL_RemovePath(prev.c_str());
@@ -171,6 +175,11 @@ SetupProc *setup_start(const std::vector<std::string> &args, const std::string &
         p->eof = true;
         return p;
     }
+    // made before fork: the child of a process with threads may only make async-signal-safe calls until exec (no malloc)
+    std::vector<char *> argv;
+    for (const std::string &a : args)
+        argv.push_back((char *)a.c_str());
+    argv.push_back(nullptr);
     p->pid = fork();
     if (p->pid == 0) {
         setsid();   // its own process group: kill() reaches the tools it starts
@@ -180,10 +189,6 @@ SetupProc *setup_start(const std::vector<std::string> &args, const std::string &
         close(o[0]), close(o[1]), close(i[0]), close(i[1]);
         if (chdir(cwd.c_str()) != 0)
             _exit(127);
-        std::vector<char *> argv;
-        for (const std::string &a : args)
-            argv.push_back((char *)a.c_str());
-        argv.push_back(nullptr);
         execvp(argv[0], argv.data());
         _exit(127);
     }
@@ -238,9 +243,11 @@ bool setup_finished(SetupProc *p, int *exit_code) {
 #else
     if (p->pid > 0) {
         int st = 0;
-        if (waitpid(p->pid, &st, WNOHANG) == 0)
+        pid_t w = waitpid(p->pid, &st, WNOHANG);
+        if (w == 0)
             return false;
-        p->exit_code = WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+        p->exit_code = w == p->pid && WIFEXITED(st) ? WEXITSTATUS(st) : 1;   // -1: its status is lost, not a success
+        SDL_Log("builder ended: exit %d%s", p->exit_code, w == p->pid ? "" : " (status lost)");
         p->pid = -1;
     }
 #endif

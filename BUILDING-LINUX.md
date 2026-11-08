@@ -45,3 +45,11 @@ Local version history preserves the source before and after these changes. Game 
 ## Known visual issue
 
 On Steam Deck, distant smoke can intermittently appear and disappear during play with the 60 FPS target selected. This is a user-reported rendering issue; its cause and relationship to the frame-rate setting have not been established. Investigation is deferred. It should remain listed as an open issue when sharing the Linux changes.
+
+## Release merge, November 8
+
+This integration merges released upstream v0.3.1 into the existing Linux branch. Additional post-release bug fixes and experiments are excluded.
+
+The conflict audit retains native Linux memory/resource/signal headers, guarded fault recovery, correct virtual-pool release lengths, zeroed guest-page reuse, parent TLS/TPIDR inheritance, existing memory-operation and heap overrides, and the existing six-GiB application-pool base. Release support for larger render targets adds its extra allocation above that base. The release's native Linux build pipeline, shader/AMD corrections and performance changes are integrated.
+
+Debug Mode, bounded private crash-state capture, active-controller selection, profile locking, Open Logs and the original fullscreen/60 FPS launch settings remain available. Nintendo/Switch button positions are the default. The debug helper supplies the release's log-file setting from the session directory; it does not embed any user's home directory.

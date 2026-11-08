@@ -87,7 +87,8 @@ def main():
         latest.unlink()
     if not latest.exists():
         latest.symlink_to(session.name, target_is_directory=True)
-    env = dict(os.environ, TOTK_STATS='1', LARECOMP_DATA_ROOT=str(session))
+    env = dict(os.environ, TOTK_STATS='1', LARECOMP_DATA_ROOT=str(session),
+               TOTK_LOG_FILE=str(session / 'ultratears.log'))
     debugger = shutil.which('gdb')
     command = [str(game), '--debug', *arguments]
     if debugger:

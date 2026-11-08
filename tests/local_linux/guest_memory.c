@@ -6,6 +6,7 @@
 
 Module g_modules[MAX_MODULES];
 int g_nmodules;
+uint64_t totk_heap_extra_bytes(void) { return 0; }
 
 _Noreturn void runtime_fail(const char *message) {
     fprintf(stderr, "%s\n", message);

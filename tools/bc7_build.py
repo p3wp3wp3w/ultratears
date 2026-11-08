@@ -19,43 +19,47 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
-from toolchain import CLANG64, LINUX_TOOLS, env as tool_env  # noqa: E402
+from toolchain import CLANG64, exe as exe_name, env as tool_env  # noqa: E402
 from build_game import cpu_arch, run_limited  # noqa: E402
 import progress  # noqa: E402
 from romfs import RomFS  # noqa: E402
 
-LINUX = sys.platform == 'linux'
 SOURCES_C = ['tools/bc7build/bc7build.c', 'src/gfx/tex/astc.c', 'src/gfx/tex/bc7key.c']
 SOURCES_CXX = ['src/gfx/tex/bc7.cpp', 'src/gfx/tex/bc7enc/bc7enc.cpp', 'src/gfx/tex/bc7enc/rgbcx.cpp']
 
 
 def build_tool(env):
-    exe = ROOT / ('build/bc7build' if LINUX else 'build/bc7build.exe')
+    """build/bc7build(.exe) for this machine. Linux: against the Linux kit (its glibc headers, its static zstd and
+    libstdc++), as the game, so a builder package needs no system compiler or library."""
+    linux = os.name != 'nt'
+    exe = ROOT / ('build/bc7build' if linux else 'build/bc7build.exe')
     newest = max((ROOT / s).stat().st_mtime for s in SOURCES_C + SOURCES_CXX)
     if exe.exists() and exe.stat().st_mtime > newest:
         return exe
-    if LINUX:
-        cc, cxx_cc = str(LINUX_TOOLS['clang']), str(LINUX_TOOLS['clang++'])
-    else:
-        cc, cxx_cc = str(CLANG64 / 'clang.exe'), str(CLANG64 / 'clang++.exe')
     objs = []
     arch = cpu_arch()   # as the game: x86-64-v2 on CPUs without AVX2 (it was always v3: illegal instruction there)
+    kit = ''
+    if linux:
+        from build_game import LINUX_KIT, linux_flags
+        kit = linux_flags()
     (ROOT / 'build/obj').mkdir(parents=True, exist_ok=True)
     for s in SOURCES_C + SOURCES_CXX:
         cxx = s.endswith('.cpp')
         obj = ROOT / 'build/obj' / ('bc7build_' + s.replace('/', '_').rsplit('.', 1)[0] + '.o')
-        cmd = [cxx_cc if cxx else cc, '-O2', f'-march={arch}', '-w', '-c', str(ROOT / s), '-o', str(obj)]
+        cmd = [str(CLANG64 / exe_name('clang++' if cxx else 'clang')), '-O2', f'-march={arch}', '-w', '-c', str(ROOT / s), '-o', str(obj)]
         if cxx:
             cmd += ['-std=c++17', '-fno-exceptions', '-fno-rtti']
-        elif LINUX:
-            # bc7build.c seeks with the MSVCRT names
-            cmd += ['-D_FILE_OFFSET_BITS=64', '-D_fseeki64=fseeko', '-D_ftelli64=ftello']
+        if linux:   # bc7build.c seeks with the MSVCRT names (as PR #42)
+            cmd += kit.split() + ['-D_FILE_OFFSET_BITS=64', '-D_fseeki64=fseeko', '-D_ftelli64=ftello']
+            if cxx:
+                cmd += ['-stdlib=libstdc++']
         subprocess.run(cmd, check=True, env=env)
         objs.append(str(obj))
-    if LINUX:
-        link = [cxx_cc, '-fuse-ld=lld', '-o', str(exe)] + objs + ['-pthread', '-lzstd']
+    if linux:
+        link = [str(CLANG64 / 'clang++'), *kit.split(), '-fuse-ld=lld', '--rtlib=libgcc', '--unwindlib=libgcc', '-stdlib=libstdc++',
+                '-static-libstdc++', '-o', str(exe)] + objs + [f'-L{LINUX_KIT.as_posix()}/lib', '-l:libzstd.a', '-pthread', '-lm']
     else:
-        link = [cc, '-fuse-ld=lld', '-o', str(exe)] + objs + ['-static', '-pthread', '-lzstd', '-lc++']
+        link = [str(CLANG64 / 'clang.exe'), '-fuse-ld=lld', '-o', str(exe)] + objs + ['-static', '-pthread', '-lzstd', '-lc++']
     subprocess.run(link, check=True, env=env)
     return exe
 

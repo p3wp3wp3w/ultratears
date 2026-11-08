@@ -2,6 +2,7 @@
 #include <assert.h>
 #include "../../src/host/window_sdl.c"
 static RuntimeGamepadState observed;
+int deck_imu_start(void) { return 0; }
 void runtime_gamepad_set(const RuntimeGamepadState *s) { observed = *s; }
 void runtime_motion_live(int on) { (void)on; }
 int runtime_motion_axes(const char *s) { (void)s; return 0; }

@@ -20,24 +20,20 @@ import progress  # noqa: E402
 
 
 def start_pinned(cmd, mask, env):
-    if sys.platform == "win32":
-        CREATE_SUSPENDED, BELOW_NORMAL = 0x4, 0x4000
-        p = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             text=True, creationflags=CREATE_SUSPENDED | BELOW_NORMAL)
-        ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t(mask))
-        ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
-        return p
-    def preexec():
-        try:
+    if os.name != 'nt':   # Linux: nice 10 and the CPUs set in the child before it starts (as PR #42)
+        def limit():
             os.nice(10)
-            if hasattr(os, "sched_setaffinity"):
-                cpus = {i for i in range(64) if (mask & (1 << i))}
-                if cpus:
-                    os.sched_setaffinity(0, cpus)
-        except Exception:
-            pass
-    return subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            text=True, preexec_fn=preexec)
+            cpus = {i for i in range(64) if mask >> i & 1} & os.sched_getaffinity(0)
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+        return subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, preexec_fn=limit)
+    CREATE_SUSPENDED, BELOW_NORMAL = 0x4, 0x4000
+    p = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         text=True, creationflags=CREATE_SUSPENDED | BELOW_NORMAL)
+    ctypes.windll.kernel32.SetProcessAffinityMask(int(p._handle), ctypes.c_size_t(mask))
+    ctypes.windll.ntdll.NtResumeProcess(int(p._handle))
+    return p
 
 
 def main():
@@ -53,9 +49,8 @@ def main():
     (a.dir / 'translated').mkdir(exist_ok=True)
     env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1',
                DOTNET_CLI_HOME=str(ROOT / 'third_party/dotnet-home'))
-    xlate_name = "ultrs-shaders" if sys.platform.startswith("linux") else "ultrs-shaders.exe"
     if XLATE is None:
-        sys.exit(f"the shader translator {xlate_name} is missing: python tools/build_xlate.py")
+        sys.exit('the shader translator ultrs-shaders is missing: python tools/build_xlate.py')
     cmd = [str(XLATE)]   # tools/build_xlate.py, or the builder package's deps/shaders
     results, lock = [], threading.Lock()
     shards = [lines[i::a.workers] for i in range(a.workers)]

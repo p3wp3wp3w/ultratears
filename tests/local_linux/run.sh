@@ -4,7 +4,13 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 output="$(mktemp -d)"
 trap 'rm -rf -- "$output"' EXIT
 cc="${CC:-clang}"
-common=(-O2 -ffunction-sections -fdata-sections -Wl,--gc-sections)
+python3 - "$root" "$output" <<'PYICON'
+import pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]) / "tools"))
+import icon_png
+(pathlib.Path(sys.argv[2]) / "icon_png.h").write_text(icon_png.c_array("ultrs_icon_png", icon_png.png(256)))
+PYICON
+common=(-I"$output" -O2 -ffunction-sections -fdata-sections -Wl,--gc-sections)
 graphics=(-I"$root/src/gfx" -I"$root/src/gfx/nvn" -I"$root/src/gfx/nvn/include" -I"$root/src/gfx/compat")
 "$cc" "${common[@]}" "${graphics[@]}" "$root/tests/local_linux/vpool.c" -o "$output/vpool" -lpthread
 "$output/vpool"
@@ -21,7 +27,7 @@ if sdl_config="$(pkg-config --cflags --libs sdl3 2>/dev/null)"; then
 else
     sdl_flags=(-lSDL3)
 fi
-"$cc" "${common[@]}" "$root/tests/local_linux/controller.c" -o "$output/controller" "${sdl_flags[@]}" -lpthread
+"$cc" "${common[@]}" "$root/tests/local_linux/controller.c" -o "$output/controller" "${sdl_flags[@]}" -lpthread -lm
 "$output/controller"
 printf '%s\n' 'Linux memory-pool, guest-page reuse, POSIX signal/resource, missing-file, fault-guard, and controller regression checks passed.'
 

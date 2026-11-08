@@ -10,9 +10,16 @@
 //    own layout): +0 Ryujinx support buffer, +1..17 constant buffers c0-c16, +18..33 storage buffers, +34..57 combined
 //    textures, +58..61 images. The translator numbers bindings densely per shader; they are rewritten in the SPIR-V
 //    when it is loaded, so any vertex shader combines with any fragment shader under one pipeline layout.
+#ifndef _WIN32
+#define _GNU_SOURCE   // sched_getaffinity (cpu_count)
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>   // after windows.h (its types)
+#else
+#include <sched.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 #include <stdatomic.h>
 #include <stdio.h>
@@ -30,11 +37,25 @@
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 
-static VkDescriptorSetLayout g_layout[2];   // 0 graphics, 1 compute
+// Layouts (VKB_LAYOUT_*): graphics, compute, and with split sets the graphics buffers' (set 1).
+static VkDescriptorSetLayout g_layout[VKB_LAYOUTS];
 static VkPipelineLayout g_playout[2];
 
+// Graphics descriptors in two sets (descriptor buffers only): set 0 the textures and images, set 1 the buffers. A draw's
+// textures are those of the draw before ~76 % of the time, its buffers ~6 % (uniform offsets per object; Lookout Landing
+// and a Depths forest, 2026-11-03): with one set every draw wrote and looked up all of them again. The shaders' buffer
+// variables are moved to set 1 at load (load_module). TOTK_VK_SPLIT_SETS=0: one set, as before.
+int vkb_split_sets(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_VK_SPLIT_SETS"); v = vkb_db_on() && !(e && *e == '0'); }
+    return v;
+}
+static int is_buffer_binding(uint32_t b) { return b % VKB_STAGE_BINDINGS < VKB_B_TEX; }
+
 static void make_layouts(void) {
-    for (int compute = 0; compute < 2; compute++) {
+    for (int id = 0; id < VKB_LAYOUTS; id++) {
+        int compute = id == VKB_LAYOUT_COMPUTE;
+        if (id == VKB_LAYOUT_BUFFERS && !vkb_split_sets()) continue;
         VkDescriptorSetLayoutBinding b[128];
         VkDescriptorBindingFlags fl[128];
         uint32_t n = 0;
@@ -47,7 +68,9 @@ static void make_layouts(void) {
                 {VKB_B_IMG, VKB_NIMG, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}};
             for (unsigned k = 0; k < sizeof r / sizeof *r; k++)
                 for (uint32_t i = 0; i < r[k].count; i++) {
-                    b[n] = (VkDescriptorSetLayoutBinding){base + r[k].off + i, r[k].type, 1, sf, NULL};
+                    uint32_t at = base + r[k].off + i;
+                    if (!compute && vkb_split_sets() && is_buffer_binding(at) != (id == VKB_LAYOUT_BUFFERS)) continue;
+                    b[n] = (VkDescriptorSetLayoutBinding){at, r[k].type, 1, sf, NULL};
                     fl[n++] = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;   // only what the shaders use is written
                 }
         }
@@ -55,13 +78,24 @@ static void make_layouts(void) {
                                                           .bindingCount = n, .pBindingFlags = fl};
         VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &fi, .bindingCount = n, .pBindings = b};
         if (vkb_db_on()) { ci.pNext = NULL; ci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT; }   // vkb_desc.c
-        if (!vk_check(vk.vkCreateDescriptorSetLayout(vkc.device, &ci, NULL, &g_layout[compute]), "descriptor set layout")) die("layout");
-        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g_layout[compute]};
+        if (!vk_check(vk.vkCreateDescriptorSetLayout(vkc.device, &ci, NULL, &g_layout[id]), "descriptor set layout")) die("layout");
+    }
+    for (int compute = 0; compute < 2; compute++) {
+        VkDescriptorSetLayout sets[2];
+        uint32_t n = vkb_set_layouts(compute, sets);
+        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = n, .pSetLayouts = sets};
         if (!vk_check(vk.vkCreatePipelineLayout(vkc.device, &pi, NULL, &g_playout[compute]), "pipeline layout")) die("layout");
     }
     if (vkb_db_on()) vkb_db_layouts(g_layout);
 }
 VkDescriptorSetLayout vkb_set_layout(int compute) { if (!g_layout[0]) make_layouts(); return g_layout[compute]; }
+uint32_t vkb_set_layouts(int compute, VkDescriptorSetLayout out[2]) {   // a pipeline's sets: their count
+    if (!g_layout[0]) make_layouts();
+    out[0] = g_layout[compute];
+    if (compute || !vkb_split_sets()) return 1;
+    out[1] = g_layout[VKB_LAYOUT_BUFFERS];
+    return 2;
+}
 VkPipelineLayout vkb_pipeline_layout(int compute) { if (!g_layout[0]) make_layouts(); return g_playout[compute]; }
 
 // ---------------- the reflection (<key>.res.json): a small reader for its fixed shape ----------------
@@ -295,11 +329,12 @@ static size_t drop_cull_distance(uint32_t *w, size_t n) {
 static _Atomic uint64_t g_from_bin, g_from_spv, g_bin_refused, g_obj_live, g_obj_destroyed;
 static VkResult make_object(const char *key, const vkb_shbin_variant *v, VkShaderStageFlagBits stage, const uint32_t *spv,
                             size_t bytes, VkShaderEXT *obj) {
-    VkDescriptorSetLayout layout = vkb_set_layout(stage == VK_SHADER_STAGE_COMPUTE_BIT);
+    VkDescriptorSetLayout layouts[2];
+    uint32_t nlayouts = vkb_set_layouts(stage == VK_SHADER_STAGE_COMPUTE_BIT, layouts);
     VkShaderCreateInfoEXT ci = {VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT, .stage = stage,
         .nextStage = stage == VK_SHADER_STAGE_VERTEX_BIT ? VK_SHADER_STAGE_FRAGMENT_BIT : 0,
         .codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT, .codeSize = bytes, .pCode = spv, .pName = "main",
-        .setLayoutCount = 1, .pSetLayouts = &layout};
+        .setLayoutCount = nlayouts, .pSetLayouts = layouts};
     // 32 lanes, as the translator assumes, where the driver would pick (vk.c: vkc.subgroup_pin); the binaries on disk
     // were made the same way (their file header holds the pin, vkb_shbin.c)
     VkShaderRequiredSubgroupSizeCreateInfoEXT lanes = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
@@ -416,6 +451,7 @@ static int dref_clamp(void) {
 static uint32_t stamp_fold(uint64_t h) {
     if (dref_clamp()) h ^= 0x5BD1E995ull << 32;   // binaries made before the clamp are not used (the halves fold below)
     if (!vkc.has_interlock) h ^= 0x27D4EB2Full << 32;   // nor those of modules with the interlock (vkb_spv_drop_interlock)
+    if (vkb_split_sets()) h ^= 0x2F0B3C51ull << 32;   // nor those made with one descriptor set (buffers in set 1 now)
     return (uint32_t)(h ^ h >> 32) | 1;   // never 0
 }
 static uint32_t stamp_of(uint64_t mtime_s, uint64_t size) {
@@ -514,6 +550,8 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
     if (dref_clamp() && vkb_spv_clamp_dref(spv, nw, &clamped, &ncl)) { free(spv); spv = clamped; nw = ncl; }
     if (!vkc.has_interlock) nw = vkb_spv_drop_interlock(spv, nw);   // a device without it refused these modules (RX 570)
     nspv = nw * 4;
+    int split = nvn_stage <= 1 && vkb_split_sets();   // vertex and fragment shaders (compute keeps one set)
+    uint32_t bound = spv[3], *in_set1 = split ? calloc((bound + 31) / 32, 4) : NULL;   // ids of buffer variables
     for (size_t i = 5; i < nw;) {
         uint32_t op = spv[i] & 0xffff, wc = spv[i] >> 16;
         if (!wc || i + wc > nw) break;
@@ -522,10 +560,20 @@ static int load_module(vkb_shader *s, const char *key, int nvn_stage, uint32_t *
             if (old > 255 || remap[old] == UINT32_MAX) {
                 VLOG("shader %s: binding %u not in its reflection", key, old);
                 s->unsupported = 1;
-            } else spv[i + 3] = remap[old];
+            } else {
+                spv[i + 3] = remap[old];
+                if (in_set1 && spv[i + 1] < bound && is_buffer_binding(remap[old])) in_set1[spv[i + 1] / 32] |= 1u << (spv[i + 1] % 32);
+            }
         }
         i += wc;
     }
+    for (size_t i = 5; in_set1 && i < nw;) {   // OpDecorate %id DescriptorSet n (decoration 34)
+        uint32_t op = spv[i] & 0xffff, wc = spv[i] >> 16;
+        if (!wc || i + wc > nw) break;
+        if (op == 71 && wc == 4 && spv[i + 2] == 34 && spv[i + 1] < bound && (in_set1[spv[i + 1] / 32] >> (spv[i + 1] % 32) & 1)) spv[i + 3] = 1;
+        i += wc;
+    }
+    free(in_set1);
     // input / output locations: vertex variants; fragment inputs no vertex shader writes (audit)
     s->in_mask = vkb_spv_input_mask(spv, nw);
     s->out_mask = vkb_spv_output_mask(spv, nw);
@@ -862,6 +910,191 @@ static void ahead_start(void) {
     if (e && *e == '0') return;
     pthread_t t;
     if (pthread_create(&t, NULL, ahead_thread, NULL) == 0) pthread_detach(t);
+}
+
+// ---- UltraTears --prepare-shaders: every translated shader compiled by this GPU's driver into the binary file before
+// the game starts (tools/setup.py step graphics, the launcher before Play), on every core, so the first play has no
+// compile stalls. Shaders already in the file cost a lookup each: with nothing to do it prints "ready" in about the
+// time Vulkan takes to start. Progress on stdout: "prepare-shaders: <done> of <total>", then a "done" line.
+// It outlives a driver crash (as totk-pc-recomp dbe8daf, MIT): while a worker hands a shader to the driver, its slot of
+// prepare-journal.bin (beside the binary file) holds the shader's key, cleared when the call returns. A run that finds
+// a journal moves the keys in it into prepare-skip.txt with the GPU and driver version, and preparation skips what
+// that file lists for them (they compile at their first draw, where the driver may crash again); another driver
+// version compiles them again, and so does deleting the file. The caller runs it again after a crash (up to 3 times).
+enum { PREP_SLOTS = 64, PREP_SLOT = 72 };   // journal: a 64-character key per worker, zeros between shaders
+static struct {
+    size_t *todo, n, next;
+    _Atomic size_t done, made, failed, skipped;
+    FILE *journal;
+    pthread_mutex_t jmu;
+    char (*skip)[65];
+    size_t nskip;
+} PR = {.jmu = PTHREAD_MUTEX_INITIALIZER};
+
+static void prep_path(char *out, size_t n, const char *name) {   // beside the binary file
+    const char *bin = getenv("TOTK_SHADER_BIN");
+    if (!bin || !*bin) bin = "data/shaders/compiled.bin";
+    const char *cut = strrchr(bin, '/'), *cut2 = strrchr(bin, '\\');
+    if (cut2 > cut) cut = cut2;
+    if (cut) snprintf(out, n, "%.*s/%s", (int)(cut - bin), bin, name);
+    else snprintf(out, n, "%s", name);
+}
+static void gpu_key(char *out, size_t n) {   // vendor:device:driver version, as the skip list names a GPU and driver
+    snprintf(out, n, "%04x:%04x:%08x", vkc.props.vendorID, vkc.props.deviceID, vkc.props.driverVersion);
+}
+// A journal a crashed run left into the skip list, then the list's keys for this GPU and driver into PR.skip.
+static void prep_skip_init(void) {
+    char jp[1024], sp[1024], gk[32];
+    prep_path(jp, sizeof jp, "prepare-journal.bin");
+    prep_path(sp, sizeof sp, "prepare-skip.txt");
+    gpu_key(gk, sizeof gk);
+    size_t jn = 0;
+    char *j = read_file(jp, &jn);
+    if (j) {
+        size_t had = 0;
+        free(read_file(sp, &had));
+        FILE *f = fopen(sp, "ab");
+        int added = 0;
+        if (f && !had)
+            fputs("# Shaders the graphics driver was compiling when UltraTears --prepare-shaders died (src/gfx/vkb_shader.c):\n"
+                  "# key, GPU vendor:device:driver version. Preparation skips them on that GPU and driver; delete this file\n"
+                  "# to compile them again.\n", f);
+        for (size_t o = 0; f && o + 64 <= jn; o += PREP_SLOT)
+            if (j[o]) { fprintf(f, "%.64s %s\n", j + o, gk); added++; }
+        if (f && fclose(f) == 0) {
+            remove(jp);
+            if (added) VLOG("prepare-shaders: the last preparation died while the driver compiled %d shaders; %s lists them, "
+                            "skipped on this GPU and driver (%s)", added, sp, gk);
+        } else VLOG("prepare-shaders: cannot write %s; %s stays", sp, jp);
+        free(j);
+    }
+    char *s = read_file(sp, NULL);
+    for (char *line = s, *next; line && *line; line = next) {
+        next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        char key[65], k[32];
+        if (line[0] == '#' || sscanf(line, "%64s %31s", key, k) != 2 || strlen(key) != 64 || strcmp(k, gk)) continue;
+        char (*grown)[65] = realloc(PR.skip, (PR.nskip + 1) * sizeof *PR.skip);
+        if (grown) memcpy(grown[PR.nskip++], key, 65), PR.skip = grown;
+    }
+    free(s);
+}
+static int prep_skipped(const char *key) {
+    for (size_t i = 0; i < PR.nskip; i++) if (!memcmp(PR.skip[i], key, 64)) return 1;
+    return 0;
+}
+static void prep_journal(int slot, const char *key) {   // key NULL: the driver call returned
+    if (!PR.journal || slot >= PREP_SLOTS) return;
+    char rec[PREP_SLOT] = {0};
+    if (key) memcpy(rec, key, 64);
+    pthread_mutex_lock(&PR.jmu);
+    if (!fseek(PR.journal, (long)slot * PREP_SLOT, SEEK_SET)) fwrite(rec, 1, sizeof rec, PR.journal), fflush(PR.journal);
+    pthread_mutex_unlock(&PR.jmu);
+}
+static void *prep_worker(void *arg) {
+    int slot = (int)(intptr_t)arg;
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+    for (;;) {
+        size_t i = __atomic_fetch_add(&PR.next, 1, __ATOMIC_RELAXED);
+        if (i >= PR.n) return NULL;
+        char key[65];
+        uint32_t content;
+        vkb_shpack_key(PR.todo[i], key, &content);
+        vkb_shbin_variant v0 = {{0}, stamp_packed(content)};
+        char *j;
+        uint32_t *raw;
+        size_t nraw;
+        int stage = vkb_shpack_get(key, &j, &raw, &nraw, &content) ? stage_of(j) : -1;
+        if (stage >= 0) { free(j); free(raw); }
+        vkb_shader tmp;
+        memset(&tmp, 0, sizeof tmp);
+        uint32_t *spv;
+        size_t bytes;
+        VkShaderEXT obj;
+        if (stage >= 0 && load_module(&tmp, key, stage, &spv, &bytes)) {
+            prep_journal(slot, key);   // from here to its clearing, a crash names this shader
+            VkResult r = make_object(key, &v0, tmp.vk_stage, spv, bytes, &obj);
+            prep_journal(slot, NULL);
+            if (r == VK_SUCCESS) {
+                vk.vkDestroyShaderEXT(vkc.device, obj, NULL);
+                atomic_fetch_sub(&g_obj_live, 1);
+                atomic_fetch_add(&PR.made, 1);
+            } else atomic_fetch_add(&PR.failed, 1);
+            free(spv);
+        } else atomic_fetch_add(&PR.failed, 1);
+        atomic_fetch_add(&PR.done, 1);
+    }
+}
+static int cpu_count(void) {   // the CPUs this process may run on (a build pinned to some keeps to them)
+#ifdef _WIN32
+    DWORD_PTR mine, sys;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &mine, &sys) && mine) return __builtin_popcountll((unsigned long long)mine);
+    return (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+#else
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) > 0) return CPU_COUNT(&set);
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int)n : 1;
+#endif
+}
+int vkb_prepare_shaders(void) {
+    setvbuf(stdout, NULL, _IOLBF, 1 << 12);
+    if (!vk_init(NULL)) { printf("prepare-shaders: no Vulkan device\n"); return 1; }
+    if (!from_pack()) { printf("prepare-shaders: no shader pack (data/shaders/translated.pack): nothing to prepare\n"); return 0; }
+    uint64_t t0 = runtime_now_ns();
+    prep_skip_init();
+    size_t total = vkb_shpack_count();
+    if (!(PR.todo = malloc((total ? total : 1) * sizeof *PR.todo))) return 1;
+    for (size_t i = 0; i < total; i++) {   // what this driver has not compiled yet
+        char key[65];
+        uint32_t content;
+        vkb_shpack_key(i, key, &content);
+        vkb_shbin_variant v0 = {{0}, stamp_packed(content)};
+        vkb_shbin_mark(key, v0.stamp);
+        if (vkb_shbin_has(key, &v0)) continue;
+        if (prep_skipped(key)) { PR.skipped++; continue; }
+        PR.todo[PR.n++] = i;
+    }
+    char gk[32];
+    gpu_key(gk, sizeof gk);
+    if (!PR.n) {
+        printf("prepare-shaders: ready, %zu shaders compiled for %s (%s)%s\n", total - PR.skipped, vkc.props.deviceName, gk,
+               PR.skipped ? ", some skipped after a driver crash" : "");
+        return 0;
+    }
+    char jp[1024];
+    prep_path(jp, sizeof jp, "prepare-journal.bin");
+    if (!(PR.journal = fopen(jp, "w+b"))) VLOG("prepare-shaders: cannot create %s: a driver crash will not be recorded", jp);
+    vkb_set_layout(0), vkb_set_layout(1);   // made once, before the workers
+    int k = 0, want = cpu_count();
+    pthread_t t[PREP_SLOTS];
+    for (int i = 0; i < want && i < PREP_SLOTS; i++)
+        if (pthread_create(&t[k], NULL, prep_worker, (void *)(intptr_t)k) == 0) k++;
+    printf("prepare-shaders: compiling %zu shaders of %zu for %s (%s) on %d threads\n", PR.n, total, vkc.props.deviceName, gk, k);
+    if (!k) prep_worker((void *)(intptr_t)0);
+    for (;;) {   // progress, while the workers compile
+        size_t d = atomic_load(&PR.done);
+        printf("prepare-shaders: %zu of %zu\n", d, PR.n);
+        if (d >= PR.n) break;
+#ifdef _WIN32
+        Sleep(250);
+#else
+        struct timespec ts = {0, 250000000};
+        nanosleep(&ts, NULL);
+#endif
+    }
+    for (int i = 0; i < k; i++) pthread_join(t[i], NULL);
+    if (PR.journal) fclose(PR.journal), PR.journal = NULL, remove(jp);   // every driver call returned
+    vkb_shbin_compact();
+    printf("prepare-shaders: done, %zu compiled in %.0f s%s", atomic_load(&PR.made), (runtime_now_ns() - t0) / 1e9,
+           atomic_load(&PR.failed) ? "" : "\n");
+    if (atomic_load(&PR.failed)) printf(", %zu not (they compile at their first draw)\n", atomic_load(&PR.failed));
+    if (PR.skipped)
+        printf("prepare-shaders: %zu skipped: the graphics driver crashed while compiling them before (prepare-skip.txt)\n",
+               (size_t)PR.skipped);
+    return 0;
 }
 
 const vkb_shader *vkb_shader_get(const NVNshaderData *sd) {

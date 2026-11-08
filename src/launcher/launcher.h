@@ -42,6 +42,8 @@ bool has_text(const char *key);
 
 // ---- platform.cpp
 std::string exe_dir();                                   // the launcher's folder, UTF-8, no trailing separator
+std::string own_dir();                                   // where its settings go: exe_dir(), the AppImage file's folder
+std::string default_install();                           // the install folder before one is chosen
 std::string path_join(const std::string &a, const std::string &b);
 bool path_is_dir(const std::string &p);
 bool path_is_file(const std::string &p);
@@ -53,7 +55,7 @@ void window_dark_title(SDL_Window *w);
 Lang system_lang();
 int logical_cpus();
 // ultratears-launcher.ini: lang ("" = the system's), dump (the folder with exefs and romfs), install (another folder
-// than the launcher's), updates ("off": no questions to GitHub), update_checked (unix time), update_* (a release
+// than the launcher's), updates ("off": no questions to GitHub), update_* (a release
 // found). Which package the game was built by is not here but with the build (data/setup.json "package").
 struct Settings {
     std::vector<std::pair<std::string, std::string>> kv;
@@ -62,9 +64,13 @@ struct Settings {
 };
 Settings settings_load();
 void settings_save(const Settings &s);
-bool start_game(const std::string &folder);                // UltraTears.exe in folder, detached
+std::string game_exe(const std::string &folder);           // the game built in folder ("" none): UltraTears.exe / ultratears
+bool start_game(const std::string &folder);                // the game in folder, detached
+bool exec_game(const std::string &folder);                 // Linux: the game in this process's place (false: not done)
 void single_instance_release();
 bool restart_self();                                       // a new launcher started (after an update)
+// Linux: the downloaded AppImage made UltraTears.AppImage of the game folder root, and started (false: err says why)
+bool appimage_update(const std::string &downloaded, const std::string &root, std::string &err);
 
 // ---- update.cpp: new builder packages from GitHub Releases
 struct UpdateInfo { std::string version, name, url, sha256, page; uint64_t size = 0; };
@@ -92,11 +98,13 @@ std::string python_path(const std::string &root);         // deps/python/python.
 struct Icon { SDL_Texture *tex = nullptr; float w = 0, h = 0; };   // w, h: logical size (design pixels)
 struct Media {
     ImFont *regular = nullptr, *medium = nullptr, *small = nullptr, *title = nullptr, *brand = nullptr;
+    ImFont *label = nullptr, *control = nullptr;   // the Play screen: setting names; tabs, choices, lists
     Icon emblem, pattern, check, error, folder, warn, chevron;
 };
 extern Media g_media;
 void media_load(SDL_Renderer *r, float scale);   // fonts and icons at this scale (again when it changes)
 float font_line(ImFont *f);                       // the line height of a font's text style, design pixels
+void window_icon(SDL_Window *w);                  // the port's icon on the window (Linux; Windows: the exe's resource)
 
 // ---- ui.cpp
 void ui_init(SDL_Window *w);
@@ -104,4 +112,8 @@ void ui_frame(float scale);
 void ui_drop(const char *path);            // a folder dropped onto the window
 bool ui_close_request();                   // the window's close button: true to close now (a build asks first)
 void ui_demo(const char *name);             // development: a screen with sample data
+void ui_play_mode();                       // --play: the graphics prepared, then the game, the window only if needed
+bool ui_window_wanted();                   // false while --play has nothing to show
+bool ui_quit_wanted();                     // --play: the graphics prepared, the game to start
+bool ui_play_finish();                     // --play, after closing: the game started
 void ui_quit();                            // closing: stop the build (it resumes next time)
